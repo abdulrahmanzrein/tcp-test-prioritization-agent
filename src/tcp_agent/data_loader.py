@@ -13,17 +13,19 @@ def get_features_and_labels(df):
     y = (df["Verdict"] != 0).astype(int)
 
     #drops the columns that are not features
-    drop_cols = ["Build", "Test", "Verdict", "Duration", "DET_COV_C_Faults", "DET_COV_IMP_Faults"]
-    X = df.drop(columns=drop_cols)
-
     # DET_COV_C_Faults and DET_COV_IMP_Faults tell you how many bugs the test actually found
     # we can't know this before running the test — using it would be cheating
     # C = in changed files, IMP = in files impacted by the change
+
+    drop_cols = ["Build", "Test", "Verdict", "Duration", "DET_COV_C_Faults", "DET_COV_IMP_Faults"]
+    X = df.drop(columns=drop_cols)
+
 
     print(f"failure rate: {y.mean():.1%}  |  features: {X.shape[1]}")
     return X, y
 
 def get_metadata(df):
+    #were gonna need this info later for specifying specific tests
     return df[["Build", "Test", "Duration", "Verdict"]].copy()
 
 

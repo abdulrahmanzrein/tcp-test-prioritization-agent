@@ -1,4 +1,3 @@
-import pandas as pd
 from imblearn.over_sampling import SMOTE
 
 # features.py
