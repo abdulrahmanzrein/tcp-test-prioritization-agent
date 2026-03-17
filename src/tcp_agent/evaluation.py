@@ -13,7 +13,7 @@ def apfd(ranked_df):
     if m == 0:
         return 1.0 #no fails equals perfect score
 
-    positions = failures.index + 1 #1 indexed position of rankedlist
+    positions = failures.index.to_series() + 1 #1 indexed position of rankedlist
 
     return 1 - (positions.sum() / (n * m)) + (1 / (2 * n))
 
