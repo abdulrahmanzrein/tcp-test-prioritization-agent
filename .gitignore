@@ -23,10 +23,8 @@ env/
 # Data files — do not commit raw datasets
 data/raw/
 data/processed/
-*.csv
 *.parquet
 *.feather
-!data/sample/*.csv
 
 # Trained models
 models/
