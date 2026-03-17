@@ -77,9 +77,10 @@ Precision@10:  1.0000
 
 ## Notes
 
-- Not rebuilding the feature extraction pipeline — only consuming pre-extracted features.
-- Baseline model is a Random Forest classifier. The original paper uses a pairwise RF ranking model through RankLib but a classifier with probability scores is a reasonable starting point.
-- Future directions: learning-to-rank models, reinforcement learning, LLM signals from commit messages.
+- I'm consuming the pre-extracted feature dataset from Yaraghi et al. rather than building the extraction pipeline — that alone would be a separate project.
+- I used Random Forest with `predict_proba` instead of RankLib because it's simpler, interpretable, and scored higher than the paper's reported benchmark (APFDc 0.94 vs 0.82). I think this is partly because this dataset has a 12% failure rate vs the paper's 3% — more signal for the model to learn from.
+- SMOTE was the key insight from Mendoza et al. Without balancing, the model just predicts pass every time since 88% of tests pass.
+- Future directions: GitHub MCP integration, LLM signals from commit diffs, learning-to-rank models.
 
 ---
 
