@@ -45,9 +45,32 @@ tcp-test-prioritization-agent/
 
 ## How to Run
 
+**1. Create and activate a virtual environment**
+```bash
+python3 -m venv venv
+source venv/bin/activate
+```
+
+**2. Install dependencies**
 ```bash
 pip install -r requirements.txt
-python scripts/run_agent.py --data path/to/dataset.csv
+```
+
+**3. Run the agent**
+```bash
+PYTHONPATH=src python3 scripts/run_agent.py --data dataset.csv
+```
+
+**Expected output:**
+```
+Loaded 3683 rows, 154 columns from dataset.csv
+failure rate: 12.0%  |  features: 148
+before SMOTE - failures: 351, passes: 2595
+after SMOTE  — failures: 2595, passes: 2595
+model trained on 5190 samples
+APFD:          0.9361
+APFDc:         0.9498
+Precision@10:  1.0000
 ```
 
 ---
