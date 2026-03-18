@@ -11,6 +11,12 @@ def main():
     # run the LLM agent — gathers context and asks Claude to rank tests
     ranked = run_agent(args.data)
 
+    # print the agent's reasoning
+    print("\n--- Agent Ranking ---")
+    for item in ranked:
+        print(f"#{item['priority']} Test {item['test']} — {item['reason']}")
+    print()
+
     # merge Claude's ranking with real Verdict and Duration
     ranked_df = build_ranked_df(ranked, args.data)
 

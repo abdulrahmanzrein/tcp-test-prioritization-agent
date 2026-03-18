@@ -1,4 +1,4 @@
-#How many of the top k tests acctually failed?
+#How many of the top k tests actually failed?
 def precision_at_k(ranked_df, k=10):
     top_k = ranked_df.head(k) #top k rows
     failures_in_top_k = (top_k["Verdict"] != 0).sum() #all the rows that failed 

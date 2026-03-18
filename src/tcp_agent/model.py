@@ -10,7 +10,7 @@ def train_model(X, y, metadata):
     # split into train and test sets before training
     # the model learns from X_train and y_train and uses that information and
     # tests it out on X_test and y_test
-    # 80% training rows and 20# new tests rows
+    # 80% training rows and 20% test rows
     X_train, X_test, y_train, y_test, meta_train, metadata_test = train_test_split(
         X, y, metadata, test_size=0.2, random_state=7
     )

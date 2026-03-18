@@ -27,7 +27,7 @@ def get_recent_failures(dataset_path, n=10):
     """
     df = pd.read_csv(dataset_path)
 
-    #lambda is a oneline built in fucntion method
+    #lambda is a oneline built in function method
     failure_rates = df.groupby("Test").apply(
         lambda g: (g["Verdict"] != 0).sum() / len(g)
     ).reset_index()

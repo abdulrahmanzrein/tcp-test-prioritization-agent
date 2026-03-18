@@ -19,10 +19,10 @@ def get_tests_for_changed_files(dataset_path, changed_files):
 
         #find ALL tests whose name contains the basename
         matches = [t for t in all_tests if base_name.lower() in t.lower()]
-        #add matches to the running lisst
+        #add matches to the running list
         matched_tests.extend(matches)
     
-    # removeing duplicats via set
+    # removing duplicates via set
     return list(set(matched_tests))
 
 
