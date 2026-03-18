@@ -1,6 +1,8 @@
 from github import Github
 import os
 
+# NOTE: this file is for future use when the agent is connected to a live GitHub repo.
+# for now the agent runs on the pre-extracted dataset — git_tool.py is not called yet.
 
 def get_commit_diff(repo_name, commit_sha):
     """
