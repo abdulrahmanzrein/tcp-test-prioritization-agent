@@ -7,6 +7,7 @@ def build_ranked_df(ranked, dataset_path):
     so evaluation.py can score it.
     """
     df_ranked = pd.DataFrame(ranked)
+    df_ranked = df_ranked.rename(columns={"test": "Test"})  # Claude outputs lowercase "test", dataset uses "Test"
 
     df = pd.read_csv(dataset_path)
 

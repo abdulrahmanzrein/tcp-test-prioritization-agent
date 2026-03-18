@@ -30,7 +30,8 @@ def get_recent_failures(dataset_path, n=10):
     #lambda is a oneline built in fucntion method
     failure_rates = df.groupby("Test").apply(
         lambda g: (g["Verdict"] != 0).sum() / len(g)
-    ).reset_index() 
+    ).reset_index()
+    failure_rates.columns = ["test", "failure_rate"]  # name columns explicitly — reset_index creates unnamed column by default
 
-    top_fails = failure_rates.sort_values("failure_rate", ascending = False)
+    top_fails = failure_rates.sort_values("failure_rate", ascending=False)
     return top_fails.to_dict("records")
