@@ -35,6 +35,7 @@ def get_high_coverage_tests(dataset_path, n=10):
     
     covered_cols = df.filter(like="COV_")
     
+    df = df.copy()
     df["covered_score"] = covered_cols.mean(axis=1)
 
     # group tests by name, average their coverage score, sort highest first, take top n, return as list of dicts
