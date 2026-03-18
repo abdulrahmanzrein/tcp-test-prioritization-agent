@@ -11,7 +11,7 @@ def get_test_history(dataset_path, test_name):
     if test_df.empty:
         return {"test": test_name, "runs": 0, "failure_rate": 0.0}
     
-    runs = len(test_df)
+    runs = len(test_df) #how many builds a specific tests went through
     fails = (test_df["Verdict"] != 0).sum()
 
     return {

@@ -20,6 +20,15 @@ def get_build_failure_summary(dataset_path, build_id):
     """
     For a specific build, return which tests failed.
     """
-    # TODO: filter where Build == build_id AND Verdict != 0
-    # TODO: return build id, list of failed test names, and count
-    pass
+    
+    df = pd.read_csv(dataset_path)
+
+
+    failed = df[(df["Build"] == build_id) & (df["Verdict"] != 0)] #gives all the failed tests of a specific build
+
+    return {
+        "build_id": build_id,
+        "failed_tests": failed["Test"].tolist(),
+        "num_failures": len(failed)
+     }
+    
