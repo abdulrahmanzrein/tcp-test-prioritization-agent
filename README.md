@@ -1,6 +1,6 @@
 # TCP Test Prioritization Agent
 
-An undergraduate research project building an ML agent for Test Case Prioritization (TCP) in CI environments.
+An undergraduate research project building an LLM-based agent for Test Case Prioritization (TCP) in CI environments.
 
 Based on:
 > Yaraghi et al. (2022). *Scalable and Accurate TCP in Continuous Integration Contexts.* IEEE TSE.
@@ -16,11 +16,13 @@ When a developer pushes code, CI runs all regression tests. For large projects t
 
 ## How It Works
 
-The dataset from Yaraghi et al. contains ~150 pre-extracted features per test case from 25 open-source Java projects. Each row is one test case in a CI build. The features cover three things: execution history (how often it failed before, how old it is), test source code metrics (complexity, lines of code), and coverage (which files it exercises).
+There are two phases:
 
-The agent loads this dataset, trains a model to predict failure probability, and ranks tests from highest to lowest risk. The main evaluation metric is **APFDc** — how early in the ranked list failing tests appear, weighted by execution time.
+**Phase 1 — ML Baseline**
+Loads a pre-extracted feature dataset (~150 features per test), trains a Random Forest to predict failure probability, and ranks tests highest to lowest risk. Beats the paper's benchmark — APFDc 0.9498 vs 0.82.
 
-One thing I learned from reading the papers: the most predictive single feature is `Age` — how long the test has existed. Newer tests fail much more often. Also, the dataset is heavily imbalanced (most tests pass), so SMOTE is applied before training based on findings from the Mendoza et al. paper.
+**Phase 2 — LLM Agent**
+Claude reasons over multiple signals — historical failure rates, recent build failures, and coverage scores — and outputs a ranked test list with explanations for each decision. No retraining needed.
 
 ---
 
@@ -30,13 +32,23 @@ One thing I learned from reading the papers: the most predictive single feature 
 tcp-test-prioritization-agent/
 ├── src/
 │   └── tcp_agent/
-│       ├── data_loader.py    # loads dataset.csv
-│       ├── features.py       # cleans features, applies SMOTE
-│       ├── model.py          # trains Random Forest model
-│       ├── ranking.py        # sorts tests by predicted failure probability
-│       └── evaluation.py     # computes APFDc, APFD, Precision@k
+│       ├── agent/
+│       │   ├── tcp_agent.py      # Claude agent — gathers context and ranks tests
+│       │   └── ranker.py         # merges Claude's output with real Verdict data
+│       ├── tools/
+│       │   ├── history_tool.py   # queries historical failure rates from dataset
+│       │   ├── log_tool.py       # queries recent failed builds from dataset
+│       │   ├── dependency_tool.py # coverage-based test ranking
+│       │   └── git_tool.py       # (future) fetches live commit diffs from GitHub
+│       ├── data_loader.py        # loads dataset.csv
+│       ├── features.py           # cleans features, applies SMOTE
+│       ├── model.py              # trains Random Forest model
+│       ├── ranking.py            # sorts tests by predicted failure probability
+│       └── evaluation.py        # computes APFDc, APFD, Precision@k
 ├── scripts/
-│   └── run_agent.py
+│   ├── run_agent.py              # runs Phase 1 (ML baseline)
+│   └── run_llm_agent.py          # runs Phase 2 (LLM agent)
+├── dataset.csv
 ├── requirements.txt
 └── README.md
 ```
@@ -56,12 +68,12 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-**3. Run the agent**
+**3a. Run the ML baseline (no API key needed)**
 ```bash
 PYTHONPATH=src python3 scripts/run_agent.py --data dataset.csv
 ```
 
-**Expected output:**
+Expected output:
 ```
 Loaded 3683 rows, 154 columns from dataset.csv
 failure rate: 12.0%  |  features: 148
@@ -73,14 +85,20 @@ APFDc:         0.9498
 Precision@10:  1.0000
 ```
 
+**3b. Run the LLM agent (requires Anthropic API key)**
+```bash
+export ANTHROPIC_API_KEY="your-key-here"
+PYTHONPATH=src python3 scripts/run_llm_agent.py --data dataset.csv
+```
+
 ---
 
 ## Notes
 
-- I'm consuming the pre-extracted feature dataset from Yaraghi et al. rather than building the extraction pipeline — that alone would be a separate project.
-- I used Random Forest with `predict_proba` instead of RankLib because it's simpler, interpretable, and scored higher than the paper's reported benchmark (APFDc 0.94 vs 0.82). I think this is partly because this dataset has a 12% failure rate vs the paper's 3% — more signal for the model to learn from.
+- Phase 1 uses Random Forest with `predict_proba` instead of RankLib — simpler, interpretable, and scored higher than the paper's benchmark. The 12% failure rate in this dataset (vs the paper's 3%) gives the model more signal to learn from.
 - SMOTE was the key insight from Mendoza et al. Without balancing, the model just predicts pass every time since 88% of tests pass.
-- Future directions: GitHub MCP integration, LLM signals from commit diffs, learning-to-rank models.
+- Phase 2 agent works on pre-extracted features for now. `git_tool.py` is stubbed for future live GitHub integration.
+- The research question: can an LLM agent match ML-based TCP without retraining, while being more maintainable and explainable?
 
 ---
 
