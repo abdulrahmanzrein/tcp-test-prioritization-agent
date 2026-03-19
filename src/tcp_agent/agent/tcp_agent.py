@@ -1,4 +1,4 @@
-from tcp_agent.tools.history_tool import get_test_history, get_all_failure_rates
+from tcp_agent.tools.history_tool import get_test_history, get_all_failure_rates, get_execution_times
 from tcp_agent.tools.log_tool import get_failed_builds, get_build_failure_summary
 from tcp_agent.tools.dependency_tool import get_high_coverage_tests
 from langchain.chat_models import init_chat_model
@@ -43,7 +43,7 @@ def run_agent(dataset_path):
         temperature=0
     )
 
-    tools = [get_test_history, get_all_failure_rates, get_failed_builds, get_build_failure_summary, get_high_coverage_tests]
+    tools = [get_test_history, get_all_failure_rates, get_failed_builds, get_build_failure_summary, get_high_coverage_tests, get_execution_times]
     tools_by_name = {t.name: t for t in tools}
     model_with_tools = model.bind_tools(tools)
 

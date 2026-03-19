@@ -32,3 +32,13 @@ def get_all_failure_rates(dataset_path):
 
     top_fails = failure_rates.sort_values("failure_rate", ascending=False)
     return top_fails.to_dict("records")
+
+
+@tool
+def get_execution_times(dataset_path):
+    """Get average execution time for every test. Returns all tests sorted by duration (slowest first). Use this to factor in test cost — fast tests that might fail should run before slow ones."""
+    df = pd.read_csv(dataset_path)
+    exec_times = df.groupby("Test")["Duration"].mean().reset_index()
+    exec_times.columns = ["test", "avg_duration"]
+    exec_times = exec_times.sort_values("avg_duration", ascending=False)
+    return exec_times.to_dict("records")
