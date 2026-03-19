@@ -1,10 +1,9 @@
 import pandas as pd
+from langchain_core.tools import tool
 
-
+@tool
 def get_failed_builds(dataset_path, n=5):
-    """
-    Returns the n most recent builds that had at least one test failure.
-    """
+    """Get the most recent builds that had test failures. Returns build IDs and how many tests failed in each. Use this to understand recent CI stability and find builds worth investigating."""
     df = pd.read_csv(dataset_path)
 
     # count how many tests failed per build
@@ -15,11 +14,9 @@ def get_failed_builds(dataset_path, n=5):
     failed = fail_per_build[fail_per_build["num_failures"] > 0]
     return failed.sort_values("build", ascending=False).head(n).to_dict("records")
 
-
+@tool
 def get_build_failure_summary(dataset_path, build_id):
-    """
-    For a specific build, return which tests failed.
-    """
+    """Get the list of tests that failed in a specific build. Use this after get_failed_builds to see exactly which tests broke in a particular build."""
     
     df = pd.read_csv(dataset_path)
 

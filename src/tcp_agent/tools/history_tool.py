@@ -1,10 +1,9 @@
 import pandas as pd
+from langchain_core.tools import tool
 
-
+@tool
 def get_test_history(dataset_path, test_name):
-    """
-    Returns failure rate and run count for a specific test.
-    """
+    """Look up a single test's history. Returns how many builds it ran in and what percentage of those it failed. Use this to drill into a specific test you're suspicious about."""
     df = pd.read_csv(dataset_path)
     test_df = df[df["Test"] == test_name]
     
@@ -20,11 +19,9 @@ def get_test_history(dataset_path, test_name):
         "failure_rate": round(fails / runs, 3)
     }
 
-
+@tool
 def get_recent_failures(dataset_path, n=10):
-    """
-    Returns the n tests with the highest failure rates.
-    """
+    """Get the top n tests ranked by historical failure rate. Use this first to see which tests fail most often across all builds. This is usually the strongest signal for predicting future failures."""
     df = pd.read_csv(dataset_path)
 
     #lambda is a oneline built in function method

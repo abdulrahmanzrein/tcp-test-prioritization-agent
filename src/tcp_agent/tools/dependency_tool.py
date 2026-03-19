@@ -1,6 +1,7 @@
 import pandas as pd
+from langchain_core.tools import tool
 
-
+@tool
 def get_tests_for_changed_files(dataset_path, changed_files):
     """
     Given a list of changed filenames, return tests that likely cover them.
@@ -26,11 +27,9 @@ def get_tests_for_changed_files(dataset_path, changed_files):
     return list(set(matched_tests))
 
 
+@tool
 def get_high_coverage_tests(dataset_path, n=10):
-    """
-    Returns the n tests with the highest average coverage score.
-    Uses COV_* columns from the dataset.
-    """
+    """Get the top n tests with the highest code coverage scores. Tests that cover more code are more likely to catch regressions. Use this to find high-value safety-net tests."""
     df = pd.read_csv(dataset_path)
     
     covered_cols = df.filter(like="COV_")
