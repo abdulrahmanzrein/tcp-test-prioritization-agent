@@ -8,6 +8,7 @@ def build_ranked_df(ranked, dataset_path):
     """
     df_ranked = pd.DataFrame(ranked)
     df_ranked = df_ranked.rename(columns={"test": "Test"})  # Claude outputs lowercase "test", dataset uses "Test"
+    df_ranked["Test"] = pd.to_numeric(df_ranked["Test"], errors="coerce")  # Claude returns strings, dataset uses ints
 
     df = pd.read_csv(dataset_path)
 

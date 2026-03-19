@@ -17,8 +17,8 @@ Your job is to rank tests by how likely they are to fail in the next build.
 You have tools available to gather information about test history, build failures, 
 coverage scores, and execution times. Call whichever tools you need to make your decision.
 
-When you have enough information, output ONLY a JSON array ranking tests from most 
-likely to fail first. No extra text.
+When you have enough information, output ONLY a JSON array ranking ALL tests from most
+likely to fail first. You must include every test from the dataset. No extra text.
 
 Format:
 [
@@ -62,7 +62,7 @@ def run_agent(dataset_path):
         for tool_call in state["messages"][-1].tool_calls:
             t = tools_by_name[tool_call["name"]]
             observation = t.invoke(tool_call["args"])
-            result.append(ToolMessage(content=observation, tool_call_id=tool_call["id"]))
+            result.append(ToolMessage(content=str(observation), tool_call_id=tool_call["id"]))
         return {"messages": result}
 
     def should_continue(state):
@@ -71,3 +71,23 @@ def run_agent(dataset_path):
             return "tool_node"
         return END
 
+    # build the graph
+    agent = StateGraph(MessagesState)
+    agent.add_node("llm_call", llm_call)
+    agent.add_node("tool_node", tool_node)
+    agent.add_edge(START, "llm_call")
+    agent.add_conditional_edges("llm_call", should_continue, ["tool_node", END])
+    agent.add_edge("tool_node", "llm_call")
+
+    # compile and run
+    compiled = agent.compile()
+    from langchain.messages import HumanMessage
+    result = compiled.invoke({"messages": [HumanMessage(content=f"Prioritize tests for the next build. The dataset is at: {dataset_path}")]})
+
+    # parse the final ranking from Claude's last message
+    import json
+    raw = result["messages"][-1].content
+    raw = raw.strip().replace("```json", "").replace("```", "")
+    raw = raw[raw.find("["):raw.rfind("]") + 1]
+    ranked = json.loads(raw)
+    return ranked
