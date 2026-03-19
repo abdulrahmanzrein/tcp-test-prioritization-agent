@@ -20,8 +20,8 @@ def get_test_history(dataset_path, test_name):
     }
 
 @tool
-def get_recent_failures(dataset_path, n=10):
-    """Get the top n tests ranked by historical failure rate. Use this first to see which tests fail most often across all builds. This is usually the strongest signal for predicting future failures."""
+def get_all_failure_rates(dataset_path):
+    """Get every test in the dataset ranked by historical failure rate. Returns all tests with their failure rate (0.0 to 1.0). Use this first to get the full picture of which tests fail the most."""
     df = pd.read_csv(dataset_path)
 
     #lambda is a oneline built in function method
