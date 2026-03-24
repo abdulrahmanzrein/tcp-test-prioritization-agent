@@ -2,6 +2,7 @@ import argparse
 from tcp_agent.agent.tcp_agent import run_agent
 from tcp_agent.agent.ranker import build_ranked_df
 from tcp_agent.evaluation import apfd, apfdc, precision_at_k
+import pandas as pd
 
 def main():
     parser = argparse.ArgumentParser()
@@ -9,7 +10,14 @@ def main():
     args = parser.parse_args()
 
     # run the LLM agent — gathers context and asks Claude to rank tests
-    ranked = run_agent(args.data)
+    df = pd.read_csv(args.data)
+    builds = sorted(df["Build"].unique())
+    target_build = builds[-1]
+    history = df[df["Build"] != target_build]
+    target = df[df["Build"] == target_build]
+    history.to_csv("/tmp/history.csv", index=False)
+
+    ranked = run_agent("/tmp/history.csv")
 
     # print the agent's reasoning
     print("\n--- Agent Ranking ---")
@@ -18,7 +26,7 @@ def main():
     print()
 
     # merge Claude's ranking with real Verdict and Duration
-    ranked_df = build_ranked_df(ranked, args.data)
+    ranked_df = build_ranked_df(ranked, target)
 
     # evaluate how good Claude's ranking is
     print(f"APFD:          {apfd(ranked_df):.4f}")
