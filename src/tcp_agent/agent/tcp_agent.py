@@ -151,6 +151,9 @@ def run_agent(dataset_path):
         return {"messages": result}
 
     def should_continue(state):
+        # stop the agent if it's been looping too long
+        if state.get("llm_calls", 0) > 10:
+            return END
         last_message = state["messages"][-1]
         if last_message.tool_calls:
             return "tool_node"
