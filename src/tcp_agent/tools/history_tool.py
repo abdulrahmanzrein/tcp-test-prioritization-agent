@@ -65,8 +65,6 @@ def get_test_risk_profile(dataset_path):
         "REC_RecentTransitionRate", "REC_TotalTransitionRate",
         "REC_Age",
         "REC_RecentAssertRate", "REC_RecentExcRate",
-        # does the code this test covers have known bugs?
-        "DET_COV_C_Faults", "DET_COV_IMP_Faults",
         # how much changed/impacted code does this test cover
         "COV_ChnScoreSum", "COV_ImpScoreSum",
         "COV_ChnCount", "COV_ImpCount",

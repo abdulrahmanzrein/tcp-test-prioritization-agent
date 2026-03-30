@@ -58,10 +58,8 @@ Same complexity/process/churn metrics but for the production code each test cove
 - _C_ = directly changed code, _IMP_ = impacted (downstream) code
 Tests covering complex, recently-changed production code are higher priority.
 
-### Fault Detection (DET_COV_ columns) — STRONG SIGNAL
-- DET_COV_C_Faults — known faults in changed covered code
-- DET_COV_IMP_Faults — known faults in impacted covered code
-Non-zero values = the test covers code with known bugs. Prioritize these.
+### Fault Detection (DET_COV_ columns)
+These columns are not available at ranking time — excluded to keep the evaluation fair.
 
 ## Prioritization Strategy
 
@@ -76,9 +74,9 @@ Tests with REC_RecentFailRate > 0 and REC_LastVerdict = 1 (failed last build).
 Rank by REC_RecentFailRate descending, break ties with historical failure rate.
 Among similar rates, prefer faster tests.
 
-**Tier 3: High-risk tests with fault signals**
-Tests with DET_COV_C_Faults > 0 or DET_COV_IMP_Faults > 0, especially those covering
-recently changed code (COV_ChnScoreSum > 0). Rank by combined fault + coverage signal.
+**Tier 3: High-risk tests covering changed code**
+Tests with COV_ChnScoreSum > 0 or COV_ImpScoreSum > 0 — they cover recently changed or
+impacted production code and are most likely to catch new regressions. Rank by coverage score descending.
 
 **Tier 4: Tests with historical failures but not recent**
 Tests with non-zero historical failure rate but REC_RecentFailRate = 0.
@@ -93,7 +91,7 @@ Everything else, ordered by execution cost (fastest first).
 
 ## Tool Usage Strategy
 
-1. Start with get_test_risk_profile — this gives you the REC_, DET_COV_, and COV_ features
+1. Start with get_test_risk_profile — this gives you the REC_, COV_, and TES_CHN_ features
    for every test in one call. This is your richest data source.
 2. Call get_all_failure_rates to cross-reference overall failure history
 3. Call get_execution_times to factor in test cost for cost-aware ordering
