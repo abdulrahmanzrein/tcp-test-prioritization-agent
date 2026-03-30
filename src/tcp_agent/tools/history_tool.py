@@ -42,3 +42,40 @@ def get_execution_times(dataset_path):
     exec_times.columns = ["test", "avg_duration"]
     exec_times = exec_times.sort_values("avg_duration", ascending=False)
     return exec_times.to_dict("records")
+
+
+@tool
+def get_test_risk_profile(dataset_path):
+    """Get the most recent risk profile for every test using REC_ (execution history) and DET_COV_ (fault detection) features.
+    Returns each test's latest build snapshot with: recent/total failure rates, last verdict,
+    transition rates, failure age, coverage fault counts, and change/impact coverage scores.
+    These are the strongest predictive signals — call this early to guide your ranking."""
+    df = pd.read_csv(dataset_path)
+
+    # get the latest build for each test — higher build id = more recent
+    latest = df.sort_values("Build", ascending=False).groupby("Test").first()
+    latest = latest.reset_index().copy()
+
+    # only grab the columns that actually matter for ranking
+    keep_cols = [
+        "Test",
+        # how often it fails, did it fail last time, how long ago, etc
+        "REC_RecentFailRate", "REC_TotalFailRate",
+        "REC_LastVerdict", "REC_LastFailureAge",
+        "REC_RecentTransitionRate", "REC_TotalTransitionRate",
+        "REC_Age",
+        "REC_RecentAssertRate", "REC_RecentExcRate",
+        # does the code this test covers have known bugs?
+        "DET_COV_C_Faults", "DET_COV_IMP_Faults",
+        # how much changed/impacted code does this test cover
+        "COV_ChnScoreSum", "COV_ImpScoreSum",
+        "COV_ChnCount", "COV_ImpCount",
+        # was the test itself recently edited
+        "TES_CHN_LinesAdded", "TES_CHN_LinesDeleted",
+    ]
+
+    # filter out any columns that dont exist in this dataset
+    keep_cols = [c for c in keep_cols if c in latest.columns]
+    result = latest[keep_cols].rename(columns={"Test": "test"})
+    result = result.sort_values("REC_RecentFailRate", ascending=False)
+    return result.to_dict("records")
