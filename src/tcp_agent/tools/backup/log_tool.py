@@ -17,9 +17,8 @@ def get_failed_builds(dataset_path, n=5):
 @tool
 def get_build_failure_summary(dataset_path, build_id):
     """Get the list of tests that failed in a specific build. Use this after get_failed_builds to see exactly which tests broke in a particular build."""
-    
-    df = pd.read_csv(dataset_path)
 
+    df = pd.read_csv(dataset_path)
 
     failed = df[(df["Build"] == build_id) & (df["Verdict"] != 0)] #gives all the failed tests of a specific build
 
@@ -28,4 +27,3 @@ def get_build_failure_summary(dataset_path, build_id):
         "failed_tests": failed["Test"].tolist(),
         "num_failures": len(failed)
      }
-    
