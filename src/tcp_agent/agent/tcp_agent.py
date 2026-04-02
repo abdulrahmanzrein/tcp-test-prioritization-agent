@@ -1,4 +1,6 @@
 from tcp_agent.tools.history_tool import get_all_failure_rates, get_test_risk_profile
+from tcp_agent.tools.complexity_tool import get_test_complexity
+from tcp_agent.tools.covered_code_risk_tool import get_covered_code_risk
 from langchain.chat_models import init_chat_model
 from langchain_core.tools import tool
 from langchain.messages import AnyMessage, SystemMessage
@@ -91,9 +93,13 @@ Everything else, ordered by execution cost (fastest first).
 
 ## Tool Usage Strategy
 
-1. Start with get_test_risk_profile — this gives you the REC_, DET_COV_, COV_, and TES_CHN_
-   features for every test in one call. This is your richest data source.
-2. Call get_all_failure_rates to cross-reference overall historical failure rates
+1. Start with get_test_risk_profile — gives REC_, DET_COV_, COV_, and TES_CHN_ features
+   for every test in one call. This is your richest data source.
+2. Call get_all_failure_rates to cross-reference overall historical failure rates.
+3. Call get_test_complexity for TES_COM_ + TES_PRO_ (37 features) — test file complexity
+   and ownership. Complex tests with many contributors are more failure-prone.
+4. Call get_covered_code_risk for COD_COV_ (81 features) — complexity/churn of the
+   production code each test covers. Tests covering risky code are higher priority.
 
 ## Output Format
 
@@ -122,7 +128,7 @@ def run_agent(dataset_path):
         temperature=0
     )
 
-    tools = [get_all_failure_rates, get_test_risk_profile]
+    tools = [get_all_failure_rates, get_test_risk_profile, get_test_complexity, get_covered_code_risk]
     tools_by_name = {t.name: t for t in tools}
     model_with_tools = model.bind_tools(tools)
 

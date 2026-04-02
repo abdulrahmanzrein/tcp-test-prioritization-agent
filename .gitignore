@@ -21,6 +21,7 @@ env/
 *.ipynb_checkpoints
 
 # Data files — do not commit raw datasets
+datasets/
 data/raw/
 data/processed/
 *.parquet
