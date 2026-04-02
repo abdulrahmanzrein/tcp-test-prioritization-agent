@@ -6,11 +6,12 @@ def get_all_failure_rates(dataset_path):
     """Get every test in the dataset ranked by historical failure rate. Returns all tests with their failure rate (0.0 to 1.0). Use this first to get the full picture of which tests fail the most."""
     df = pd.read_csv(dataset_path)
 
-    #lambda is a oneline built in function method
-    failure_rates = df.groupby("Test").apply(
-        lambda g: (g["Verdict"] != 0).sum() / len(g)
-    ).reset_index()
-    failure_rates.columns = ["test", "failure_rate"]  # name columns explicitly — reset_index creates unnamed column by default
+    failure_rates = (
+        df.assign(_fail=df["Verdict"].ne(0))
+        .groupby("Test", as_index=False)["_fail"]
+        .mean()
+        .rename(columns={"Test": "test", "_fail": "failure_rate"})
+    )
 
     top_fails = failure_rates.sort_values("failure_rate", ascending=False)
     return top_fails.to_dict("records")
