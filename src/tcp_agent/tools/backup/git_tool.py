@@ -19,7 +19,7 @@ def get_commit_diff(repo_name, commit_sha):
             "filename": file.filename,
             "patch": file.patch
         })
-    
+
     return changed_files
 
 def get_commit_metadata(repo_name, commit_sha):
@@ -30,7 +30,6 @@ def get_commit_metadata(repo_name, commit_sha):
     g = Github(os.getenv("GITHUB_TOKEN"))
     repo = g.get_repo(repo_name)
     commit = repo.get_commit(commit_sha)
-
 
     return {
         "author": commit.commit.author.name,

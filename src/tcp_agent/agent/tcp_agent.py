@@ -1,6 +1,4 @@
-from tcp_agent.tools.history_tool import get_test_history, get_all_failure_rates, get_execution_times, get_test_risk_profile
-from tcp_agent.tools.log_tool import get_failed_builds, get_build_failure_summary
-from tcp_agent.tools.dependency_tool import get_high_coverage_tests
+from tcp_agent.tools.history_tool import get_all_failure_rates, get_test_risk_profile
 from langchain.chat_models import init_chat_model
 from langchain_core.tools import tool
 from langchain.messages import AnyMessage, SystemMessage
@@ -93,13 +91,9 @@ Everything else, ordered by execution cost (fastest first).
 
 ## Tool Usage Strategy
 
-1. Start with get_test_risk_profile — this gives you the REC_, DET_COV_, and COV_ features
-   for every test in one call. This is your richest data source.
-2. Call get_all_failure_rates to cross-reference overall failure history
-3. Call get_execution_times to factor in test cost for cost-aware ordering
-4. Call get_high_coverage_tests to find high-value safety-net tests
-5. Call get_failed_builds then get_build_failure_summary to check recent failure patterns
-6. Use get_test_history only if you need to drill into a specific suspicious test
+1. Start with get_test_risk_profile — this gives you the REC_, DET_COV_, COV_, and TES_CHN_
+   features for every test in one call. This is your richest data source.
+2. Call get_all_failure_rates to cross-reference overall historical failure rates
 
 ## Output Format
 
@@ -128,7 +122,7 @@ def run_agent(dataset_path):
         temperature=0
     )
 
-    tools = [get_test_history, get_all_failure_rates, get_failed_builds, get_build_failure_summary, get_high_coverage_tests, get_execution_times, get_test_risk_profile]
+    tools = [get_all_failure_rates, get_test_risk_profile]
     tools_by_name = {t.name: t for t in tools}
     model_with_tools = model.bind_tools(tools)
 
