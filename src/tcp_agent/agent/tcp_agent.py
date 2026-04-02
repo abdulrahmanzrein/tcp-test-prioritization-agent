@@ -1,4 +1,9 @@
-from tcp_agent.tools.history_tool import get_all_failure_rates, get_test_risk_profile
+from tcp_agent.tools.history_tool import get_test_history, get_all_failure_rates, get_execution_times, get_test_risk_profile
+from tcp_agent.tools.log_tool import get_failed_builds, get_build_failure_summary
+from tcp_agent.tools.dependency_tool import get_high_coverage_tests
+from tcp_agent.tools.complexity_tool import get_test_complexity
+from tcp_agent.tools.covered_code_risk_tool import get_covered_code_risk
+from tcp_agent.config import AgentMode, set_mode
 from langchain.chat_models import init_chat_model
 from langchain_core.tools import tool
 from langchain.messages import AnyMessage, SystemMessage
@@ -50,6 +55,7 @@ Recently modified tests are more likely to fail (new assertions, refactored logi
 Development activity on the test file:
 - TES_PRO_CommitCount, TES_PRO_DistinctDevCount — how actively maintained
 - TES_PRO_OwnersContribution — bus factor / ownership concentration
+Tests with many contributors or high churn may be less stable.
 
 ### Covered Code Metrics (COD_COV_*_C_ and COD_COV_*_IMP_ columns) — MODERATE SIGNAL
 Same complexity/process/churn metrics but for the production code each test covers:
@@ -91,9 +97,17 @@ Everything else, ordered by execution cost (fastest first).
 
 ## Tool Usage Strategy
 
-1. Start with get_test_risk_profile — this gives you the REC_, DET_COV_, COV_, and TES_CHN_
-   features for every test in one call. This is your richest data source.
-2. Call get_all_failure_rates to cross-reference overall historical failure rates
+1. Start with get_test_risk_profile — this gives you the REC_, DET_COV_, and COV_ features
+   for every test in one call. This is your richest data source.
+2. Call get_all_failure_rates to cross-reference overall failure history
+3. Call get_execution_times to factor in test cost for cost-aware ordering
+4. Call get_high_coverage_tests to find high-value safety-net tests
+5. Call get_test_complexity to get test file complexity and ownership (TES_COM_ + TES_PRO_)
+   — complex tests with many contributors are more failure-prone
+6. Call get_covered_code_risk to get production code risk metrics (COD_COV_*) — tests
+   covering complex, high-churn code are higher priority
+7. Call get_failed_builds then get_build_failure_summary to check recent failure patterns
+8. Use get_test_history only if you need to drill into a specific suspicious test
 
 ## Output Format
 
@@ -116,13 +130,26 @@ class MessagesState(TypedDict):
     llm_calls: int
 
 
-def run_agent(dataset_path):
+def run_agent(dataset_path, mode: AgentMode = AgentMode.PILOT):
+    # set global mode so tools know whether to read CSV or extract live
+    set_mode(mode, dataset_path=dataset_path)
+
     model = init_chat_model(
         "claude-sonnet-4-6",
         temperature=0
     )
 
-    tools = [get_all_failure_rates, get_test_risk_profile]
+    tools = [
+        get_test_history,
+        get_all_failure_rates,
+        get_failed_builds,
+        get_build_failure_summary,
+        get_high_coverage_tests,
+        get_execution_times,
+        get_test_risk_profile,
+        get_test_complexity,
+        get_covered_code_risk,
+    ]
     tools_by_name = {t.name: t for t in tools}
     model_with_tools = model.bind_tools(tools)
 

@@ -11,13 +11,22 @@ if str(SRC_DIR) not in sys.path:
 from tcp_agent.agent.tcp_agent import run_agent
 from tcp_agent.agent.ranker import build_ranked_df
 from tcp_agent.evaluation import apfd, apfdc, precision_at_k
+from tcp_agent.config import AgentMode
 import pandas as pd
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", required=True, help="path to dataset CSV")
+    parser.add_argument(
+        "--mode",
+        choices=["pilot", "production"],
+        default="pilot",
+        help="Agent mode: 'pilot' reads from CSV (default), 'production' extracts from real sources",
+    )
     args = parser.parse_args()
+
+    mode = AgentMode.PILOT if args.mode == "pilot" else AgentMode.PRODUCTION
 
     # run the LLM agent — gathers context and asks Claude to rank tests
     df = pd.read_csv(args.data)
@@ -27,7 +36,7 @@ def main():
     target = df[df["Build"] == target_build]
     history.to_csv("/tmp/history.csv", index=False)
 
-    ranked = run_agent("/tmp/history.csv")
+    ranked = run_agent("/tmp/history.csv", mode=mode)
 
     # print the agent's reasoning
     print("\n--- Agent Ranking ---")

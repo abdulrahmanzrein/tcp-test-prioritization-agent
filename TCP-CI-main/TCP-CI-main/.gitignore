@@ -1,0 +1,12 @@
+.ipynb_checkpoints
+*.csv
+*.png
+*.udb
+*.txt
+*.sh
+__pycache__
+.vscode
+.idea
+datasets
+*.tex
+jobs
