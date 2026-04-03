@@ -48,10 +48,19 @@ def build_ranked_df(ranked, target_df):
     target = target_df[["Test", "Verdict", "Duration"]].copy()
 
     # attach real Verdict and Duration to Claude's ranked list
-    merged = pd.merge(df_ranked, target, on="Test")
+    # use OUTER merge so tests the LLM missed still appear (ranked last)
+    merged = pd.merge(df_ranked, target, on="Test", how="outer")
+
+    # tests the LLM missed get worst priority (ranked last) — this prevents
+    # inflated APFDc from silently dropping missed failures
+    max_priority = merged["priority"].max()
+    if pd.isna(max_priority):
+        max_priority = 0
+    merged["priority"] = merged["priority"].fillna(max_priority + 1)
+    merged = merged.dropna(subset=["Verdict"])
 
     # final output looks like:
-    # test   priority  confidence  reason                        Verdict  Duration
+    # Test   priority  confidence  reason                        Verdict  Duration
     # 2757   1         0.91        high failure rate             1        3.2
     # 3102   2         0.74        failed in recent builds       0        8.1
     result = merged.sort_values("priority", ascending=True).reset_index(drop=True)
