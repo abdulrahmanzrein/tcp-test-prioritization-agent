@@ -1,142 +1,205 @@
+import json
+import time
+import warnings
+
+warnings.filterwarnings(
+    "ignore",
+    message=r"urllib3 v2 only supports OpenSSL",
+    category=Warning,
+)
+
 from tcp_agent.tools.history_tool import get_test_history, get_all_failure_rates, get_execution_times, get_test_risk_profile
 from tcp_agent.tools.log_tool import get_failed_builds, get_build_failure_summary
 from tcp_agent.tools.dependency_tool import get_high_coverage_tests
 from tcp_agent.tools.complexity_tool import get_test_complexity
 from tcp_agent.tools.covered_code_risk_tool import get_covered_code_risk
 from tcp_agent.config import AgentMode, set_mode
+from tcp_agent.tools.complexity_tool import get_test_complexity
+from tcp_agent.tools.covered_code_risk_tool import get_covered_code_risk
 from langchain.chat_models import init_chat_model
-from langchain_core.tools import tool
-from langchain.messages import AnyMessage, SystemMessage
+from langchain_core.messages import AnyMessage, SystemMessage, ToolMessage, HumanMessage
 from typing_extensions import TypedDict, Annotated
 import operator
-from langchain.messages import ToolMessage
-from typing import Literal
 from langgraph.graph import StateGraph, START, END
 
-SYSTEM_PROMPT = """You are a CI/CD test prioritization agent for regression testing.
+SYSTEM_PROMPT = """You are a test case prioritization (TCP) agent for Continuous Integration.
+Your task: rank regression tests so failures are detected as early and cheaply as possible,
+maximizing APFDc — the cost-cognizant Average Percentage of Faults Detected.
 
-Your job is to rank tests so that failure-likely, high-value tests run first — maximizing
-early fault detection while considering execution cost.
+## Research Foundation
 
-## Dataset Features
+This agent is built on the TCP-CI framework (Yaraghi et al., 2022), which established
+a dataset of 150+ features across 25 open-source Java projects. The key findings that
+drive our ranking strategy:
 
-The dataset has ~150 features per test organized into these groups:
+1. **Feature importance hierarchy (Table 12, Yaraghi et al.):**
+   REC (execution history) >> TES (test file metrics) >> COV/COD_COV (coverage).
+   - REC_Age (how many builds a test has existed) is the #1 most-used feature in
+     Random Forest models (usage frequency 17,034). Older tests have more signal.
+   - TES_PRO_OwnersExperience (#2, freq 10,618) and TES_PRO_AllCommitersExperience
+     (#3, freq 7,643) — tests written by less experienced developers fail more.
+   - REC_RecentFailRate and REC_TotalFailRate are the strongest direct predictors
+     of future failure.
 
-### Execution History (REC_ columns) — STRONGEST SIGNAL
-These track each test's recent and lifetime behavior:
-- REC_RecentFailRate / REC_TotalFailRate — how often the test fails (recent vs all-time)
-- REC_LastVerdict — did it pass (0) or fail (1) last time?
-- REC_RecentTransitionRate / REC_TotalTransitionRate — how often it flips pass/fail (flaky tests)
-- REC_LastFailureAge — builds since last failure (low = recently broke)
-- REC_Age — how long the test has existed
-- REC_RecentAvgExeTime / REC_RecentMaxExeTime — recent execution cost
-A value of -1 means "no data available" (e.g. new test with no history). Treat -1 as unknown, not as a real metric.
+2. **REC features alone achieve near-full-model performance (RQ2.3):**
+   REC_M (19 features) vs Full_M (150+ features) has CL=0.51, meaning the full model
+   wins only ~51% of comparisons — barely better than a coin flip. This validates
+   our REC-heavy ranking approach.
 
-### Coverage Scores (COV_ columns) — STRONG SIGNAL
-- COV_ChnScoreSum — how much recently changed code this test covers
-- COV_ImpScoreSum — how much impacted (downstream) code this test covers
-- COV_ChnCount / COV_ImpCount — number of changed/impacted files covered
-Tests covering more changed code are more likely to catch new regressions.
+3. **Coverage features have lowest marginal value (RQ2.3, Table 10-11):**
+   COV_M alone has CL=0.79 vs Full_M — it loses ~79% of the time. Coverage is useful
+   as a tiebreaker, not a primary signal.
 
-### Test Complexity (TES_COM_ columns) — MODERATE SIGNAL
-Code metrics of the test file itself:
-- Cyclomatic complexity (TES_COM_MaxCyclomatic, TES_COM_SumCyclomatic)
-- Size (TES_COM_CountLineCode, TES_COM_CountStmtExe)
-- Nesting depth (TES_COM_MaxNesting)
-More complex tests tend to be more failure-prone and cover more behavior.
+4. **Optimal test ordering (Section 2.1, Definition):** Tests should be sorted by
+   verdict (failed first), then by execution time ascending (cheapest first among
+   same-verdict tests). This minimizes wasted CI time.
 
-### Test Churn (TES_CHN_ columns) — MODERATE SIGNAL
-Recent changes to the test file:
-- TES_CHN_LinesAdded / TES_CHN_LinesDeleted — recent edits
-- TES_CHN_DMMSize / TES_CHN_DMMComplexity — design change metrics
-Recently modified tests are more likely to fail (new assertions, refactored logic).
+5. **Class imbalance (Mendoza et al., 2022):** Only ~3% of test executions fail in
+   typical CI projects. This extreme imbalance means the agent must be aggressive about
+   ranking ANY test with failure signal above the zero-signal majority.
 
-### Test Process (TES_PRO_ columns) — WEAK SIGNAL
-Development activity on the test file:
-- TES_PRO_CommitCount, TES_PRO_DistinctDevCount — how actively maintained
-- TES_PRO_OwnersContribution — bus factor / ownership concentration
-Tests with many contributors or high churn may be less stable.
+6. **Coverage scores use association-rule mining (Section 2.2):** COV_ChnScoreSum and
+   COV_ImpScoreSum are NOT traditional code coverage — they measure the confidence of
+   co-change/co-impact associations between test files and production files. Higher
+   scores mean the test historically changes alongside production code that was modified.
 
-### Covered Code Metrics (COD_COV_*_C_ and COD_COV_*_IMP_ columns) — MODERATE SIGNAL
-Same complexity/process/churn metrics but for the production code each test covers:
-- _C_ = directly changed code, _IMP_ = impacted (downstream) code
-Tests covering complex, recently-changed production code are higher priority.
+7. **DET_COV = Previously Detected Faults (Section 2.2, Definition 2):** DET_COV_C_Faults
+   counts how many known faults exist in the production code that a test directly covers.
+   DET_COV_IMP_Faults counts faults in downstream-impacted code. These are strong signals
+   because buggy code tends to stay buggy.
 
-### Fault Detection (DET_COV_ columns) — STRONG SIGNAL
-- DET_COV_C_Faults — known faults in changed covered code
-- DET_COV_IMP_Faults — known faults in impacted covered code
-Non-zero values = the test covers code with known bugs. Prioritize these.
+## Available Tools → Feature Groups
 
-## Prioritization Strategy
+1. **get_test_risk_profile** → REC_ (19) + DET_COV_ (2) + COV_ (4) + TES_CHN_ (7) features:
+   - REC_Age: builds since test first appeared (top predictor — older tests = more history)
+   - REC_RecentFailRate, REC_TotalFailRate: failure rate over last 6 builds / all builds
+   - REC_LastVerdict: 0=passed, 1=failed in most recent build
+   - REC_LastFailureAge: builds since last failure (low = recently broke)
+   - REC_RecentTransitionRate, REC_TotalTransitionRate: pass↔fail flip rate (flakiness)
+   - REC_RecentAvgExeTime, REC_RecentMaxExeTime: test execution cost
+   - DET_COV_C_Faults, DET_COV_IMP_Faults: known faults in covered production code
+   - COV_ChnScoreSum, COV_ImpScoreSum: association-rule coverage of changed/impacted code
+   - TES_CHN_*: recent edits to the test file itself (lines added/deleted, DMM metrics)
+   - A value of -1 means "no data" — treat as unknown, not a real metric.
 
-Use this tiered approach — higher tiers always outrank lower tiers:
+2. **get_all_failure_rates** → per-test overall failure_rate (0.0–1.0) across all builds.
 
-**Tier 1: Always-failing tests**
-Tests with REC_TotalFailRate >= 0.9 or historical failure rate near 100%. These are
-guaranteed failures — rank them first. Among them, prefer faster tests.
+3. **get_test_complexity** → TES_COM_ (31) + TES_PRO_ (6) features:
+   - TES_COM_SumCyclomatic, MaxNesting, CountLineCode: test code complexity
+   - TES_PRO_OwnersExperience: how much of the test the primary author wrote (low = risky)
+   - TES_PRO_AllCommitersExperience: total experience of all contributors
+   - TES_PRO_DistinctDevCount, CommitCount: ownership diffusion and churn
+   - Per Yaraghi Table 12: OwnersExperience is the #2 most important feature overall.
 
-**Tier 2: Recently failing tests**
-Tests with REC_RecentFailRate > 0 and REC_LastVerdict = 1 (failed last build).
-Rank by REC_RecentFailRate descending, break ties with historical failure rate.
-Among similar rates, prefer faster tests.
+4. **get_covered_code_risk** → COD_COV_ (81) features:
+   - Complexity/churn/process metrics of the production code each test covers.
+   - COD_COV_COM_C_SumCyclomatic: cyclomatic complexity of changed covered code
+   - COD_COV_CHN_C_LinesAdded: recent churn in covered production code
+   - COD_COV_PRO_C_DistinctDevCount: how many developers touched the covered code
+   - Lowest marginal value individually (CL=0.79), but useful for tiebreaking in T5-T6.
 
-**Tier 3: High-risk tests with fault signals**
-Tests with DET_COV_C_Faults > 0 or DET_COV_IMP_Faults > 0, especially those covering
-recently changed code (COV_ChnScoreSum > 0). Rank by combined fault + coverage signal.
+## Ranking Rules (strict priority order)
 
-**Tier 4: Tests with historical failures but not recent**
-Tests with non-zero historical failure rate but REC_RecentFailRate = 0.
-They may have been fixed, but still worth running before zero-failure tests.
+Apply these tiers mechanically. The ordering within each tier follows the optimal
+ordering from Yaraghi et al.: failed tests first, then by execution time ascending.
 
-**Tier 5: Zero-failure safety net tests**
-Never-failed tests ordered by: high coverage score > high fault coverage > low execution cost.
-These catch new regressions in changed code.
+**T1 — Persistent failures:** REC_TotalFailRate ≥ 0.9. These tests fail in nearly every
+build — they are near-guaranteed failures. Sort by execution time ascending (cheapest first)
+to catch faults with minimal CI cost.
 
-**Tier 6: Remaining tests**
-Everything else, ordered by execution cost (fastest first).
+**T2 — Recent/active failures:** REC_RecentFailRate > 0 AND REC_LastVerdict = 1. The test
+failed recently AND in the last build — it's actively broken. Sort by REC_RecentFailRate desc,
+then execution time ascending. Weight REC_LastFailureAge: lower age = failed more recently.
 
-## Tool Usage Strategy
+**T3 — Fault-adjacent tests:** DET_COV_C_Faults > 0 OR DET_COV_IMP_Faults > 0. These tests
+cover production code with known bugs (Previously Detected Faults). Prefer those also covering
+recently changed code (COV_ChnScoreSum > 0), since changed buggy code is highest risk.
 
-1. Start with get_test_risk_profile — this gives you the REC_, DET_COV_, and COV_ features
-   for every test in one call. This is your richest data source.
-2. Call get_all_failure_rates to cross-reference overall failure history
-3. Call get_execution_times to factor in test cost for cost-aware ordering
-4. Call get_high_coverage_tests to find high-value safety-net tests
-5. Call get_test_complexity to get test file complexity and ownership (TES_COM_ + TES_PRO_)
-   — complex tests with many contributors are more failure-prone
-6. Call get_covered_code_risk to get production code risk metrics (COD_COV_*) — tests
-   covering complex, high-churn code are higher priority
-7. Call get_failed_builds then get_build_failure_summary to check recent failure patterns
-8. Use get_test_history only if you need to drill into a specific suspicious test
+**T4 — Historical failures, currently passing:** failure_rate > 0 but REC_RecentFailRate = 0.
+The test has failed before but passed recently. Sort by failure_rate desc, then factor in
+TES_PRO_OwnersExperience (low experience = higher risk, per Yaraghi Table 12).
 
-## Output Format
+**T5 — High-signal never-failed tests:** Never failed, but has risk indicators:
+COV_ChnScoreSum > 0 (covers changed code), high TES_COM_SumCyclomatic (complex test),
+low TES_PRO_OwnersExperience (inexperienced owner), or high COD_COV_COM_C_SumCyclomatic
+(covers complex production code). Sort by coverage score desc, then cost ascending.
 
-When you have enough information, output ONLY a JSON array ranking ALL tests.
-Every test in the dataset must appear. No extra text outside the JSON.
+**T6 — Low-signal remainder:** No failure history, no coverage of changed code, no complexity
+flags. Sort by execution time ascending (cheapest first) — in the ~97% of tests that never
+fail (Mendoza et al.), minimizing wasted CI time is the best we can do.
 
-[
-  {
-    "test": "test_id",
-    "priority": 1,
-    "confidence": 0.87,
-    "reason": "short explanation referencing which signals drove this ranking"
-  }
-]
+## Tool Call Strategy
+
+Call get_test_risk_profile and get_all_failure_rates together first (parallel).
+Then call get_test_complexity and get_covered_code_risk together (parallel).
+This gives you all 150+ features in 2 rounds — matching the Full_M feature set from
+Yaraghi et al. Do NOT call tools beyond these 2 rounds.
+
+## Output (CRITICAL)
+
+Your FINAL message must contain ONLY a JSON array (no markdown, no text before/after).
+Every test must appear exactly once.
+
+For each **reason**, write 2-3 sentences that:
+1. State which tier (T1-T6), what the tier means, and WHY the test belongs there.
+2. Name the specific feature values AND explain what they mean in plain English
+   (e.g. "REC_TotalFailRate=1.0 means this test fails in 100% of all recorded builds").
+3. Explain tie-breaking logic if relevant (execution cost, coverage, complexity, experience).
+
+Good example:
+"Tier 1 (Persistent failure): This test fails in 100% of all builds (REC_TotalFailRate=1.0) — it is a guaranteed, persistent failure. At only 31ms average execution time (REC_RecentAvgExeTime), it is the cheapest T1 test, so it catches a fault with almost zero CI cost. Per Yaraghi et al., the optimal ordering places failed tests first, sorted by cost ascending."
+
+Bad (too vague): "High failure rate, placing first."
+Bad (no explanation): "REC_TotalFailRate=1.0 and fast."
+
+[{"test":"id","priority":1,"confidence":0.9,"reason":"..."}]
 """
 
-#MessageState holds all previous messages and llm call amount
-class MessagesState(TypedDict):
-    messages: Annotated[list[AnyMessage], operator.add]
-    llm_calls: int
+# ── Structured output schema ──────────────────────────────────────────
+# Forces the final LLM call to return exactly this shape — no JSON parsing hacks needed.
 
+from pydantic import BaseModel, Field
+
+class RankedTest(BaseModel):
+    test: str = Field(description="Test ID")
+    priority: int = Field(description="1 = run first")
+    confidence: float = Field(description="0.0–1.0")
+    reason: str = Field(description="2-3 sentence explanation citing tier and feature values")
+
+class PrioritizedTests(BaseModel):
+    ranked_tests: list[RankedTest] = Field(description="All tests, ordered by priority")
+
+
+# ── Agent state ───────────────────────────────────────────────────────
+
+class AgentState(TypedDict):
+    messages: Annotated[list[AnyMessage], operator.add]
+
+
+# ── LLM call with rate-limit retry ───────────────────────────────────
+
+def _invoke_with_retry(model, messages, max_retries=5):
+    for attempt in range(max_retries):
+        try:
+            return model.invoke(messages)
+        except Exception as e:
+            if "429" in str(e) or "rate_limit" in str(e).lower():
+                time.sleep(65)
+            else:
+                raise
+    raise Exception(f"Still rate-limited after {max_retries} retries")
+
+
+# ── Main agent function ──────────────────────────────────────────────
 
 def run_agent(dataset_path, mode: AgentMode = AgentMode.PILOT):
     # set global mode so tools know whether to read CSV or extract live
     set_mode(mode, dataset_path=dataset_path)
 
     model = init_chat_model(
-        "claude-sonnet-4-6",
-        temperature=0
+        "claude-haiku-4-5-20251001",
+        temperature=0,
+        max_tokens=16384,
     )
 
     tools = [
@@ -149,54 +212,57 @@ def run_agent(dataset_path, mode: AgentMode = AgentMode.PILOT):
         get_test_risk_profile,
         get_test_complexity,
         get_covered_code_risk,
-    ]
+    , get_test_complexity, get_covered_code_risk]
     tools_by_name = {t.name: t for t in tools}
     model_with_tools = model.bind_tools(tools)
 
-    def llm_call(state):
-        return {
-            "messages": [
-                model_with_tools.invoke(
-                    [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
-                )
-            ],
-            "llm_calls": state.get("llm_calls", 0) + 1
-        }
+    # ── Graph nodes ───────────────────────────────────────────────────
 
-    def tool_node(state):
-        result = []
+    def call_llm(state: AgentState):
+        msgs = [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
+        response = _invoke_with_retry(model_with_tools, msgs)
+        return {"messages": [response]}
+
+    def call_tools(state: AgentState):
+        tool_results = []
         for tool_call in state["messages"][-1].tool_calls:
-            t = tools_by_name[tool_call["name"]]
-            observation = t.invoke(tool_call["args"])
-            result.append(ToolMessage(content=str(observation), tool_call_id=tool_call["id"]))
-        return {"messages": result}
+            tool = tools_by_name[tool_call["name"]]
+            result = tool.invoke(tool_call["args"])
+            tool_results.append(ToolMessage(content=str(result), tool_call_id=tool_call["id"]))
+        return {"messages": tool_results}
 
-    def should_continue(state):
-        # stop the agent if it's been looping too long
-        if state.get("llm_calls", 0) > 10:
-            return END
-        last_message = state["messages"][-1]
-        if last_message.tool_calls:
-            return "tool_node"
+    def should_continue(state: AgentState):
+        if state["messages"][-1].tool_calls:
+            return "call_tools"
         return END
 
-    # build the graph
-    agent = StateGraph(MessagesState)
-    agent.add_node("llm_call", llm_call)
-    agent.add_node("tool_node", tool_node)
-    agent.add_edge(START, "llm_call")
-    agent.add_conditional_edges("llm_call", should_continue, ["tool_node", END])
-    agent.add_edge("tool_node", "llm_call")
+    # ── Build graph ───────────────────────────────────────────────────
 
-    # compile and run
-    compiled = agent.compile()
-    from langchain.messages import HumanMessage
-    result = compiled.invoke({"messages": [HumanMessage(content=f"Prioritize tests for the next build. The dataset is at: {dataset_path}")]})
+    graph = StateGraph(AgentState)
+    graph.add_node("call_llm", call_llm)
+    graph.add_node("call_tools", call_tools)
+    graph.add_edge(START, "call_llm")
+    graph.add_conditional_edges("call_llm", should_continue, ["call_tools", END])
+    graph.add_edge("call_tools", "call_llm")
+    agent = graph.compile()
 
-    # parse the final ranking from Claude's last message
-    import json
-    raw = result["messages"][-1].content
-    raw = raw.strip().replace("```json", "").replace("```", "")
-    raw = raw[raw.find("["):raw.rfind("]") + 1]
-    ranked = json.loads(raw)
-    return ranked
+    # ── Run the agent (tool-calling phase) ────────────────────────────
+
+    result = agent.invoke({
+        "messages": [HumanMessage(
+            content=f"Prioritize tests for the next build. The dataset is at: {dataset_path}"
+        )]
+    })
+
+    # ── Extract structured output (ranking phase) ─────────────────────
+    # The agent's last message contains the ranking. We ask a structured-output
+    # model to parse it, so we never manually parse JSON.
+
+    final_content = result["messages"][-1].content
+    structured_model = model.with_structured_output(PrioritizedTests)
+    parsed = _invoke_with_retry(structured_model, [
+        SystemMessage(content="Extract the test prioritization from this message into the schema. Keep all reasons intact."),
+        HumanMessage(content=final_content),
+    ])
+
+    return [t.model_dump() for t in parsed.ranked_tests]
