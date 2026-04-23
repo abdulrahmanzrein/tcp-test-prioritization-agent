@@ -64,13 +64,16 @@ TES_PRO_COLS = [f"TES_PRO_{m}" for m in _PROCESS_METRICS]
 ALL_COLS = TES_COM_COLS + TES_PRO_COLS  # 37 total
 
 
-def _pilot_get_test_complexity(dataset_path: str) -> list[dict]:
+def _pilot_get_test_complexity(dataset_path: str, test_ids=None) -> list[dict]:
     """Pilot mode: read TES_COM_ + TES_PRO_ features from the CSV."""
     df = pd.read_csv(dataset_path)
 
     # get the latest build for each test (same pattern as get_test_risk_profile)
     latest = df.sort_values("Build", ascending=False).groupby("Test").first()
     latest = latest.reset_index().copy()
+
+    if test_ids is not None:
+        latest = latest[latest["Test"].isin(test_ids)]
 
     keep_cols = ["Test"] + [c for c in ALL_COLS if c in latest.columns]
     result = latest[keep_cols].rename(columns={"Test": "test"})
@@ -107,8 +110,8 @@ def _production_get_test_complexity() -> list[dict]:
 
 
 @tool
-def get_test_complexity(dataset_path: str) -> list[dict]:
-    """Get the complexity and ownership profile for every test.
+def get_test_complexity(dataset_path: str, test_ids=None) -> list[dict]:
+    """Get the complexity and ownership profile for every test (or a subset).
 
     Returns 37 features per test:
     - TES_COM_ (31 features): Static complexity metrics of the test file itself —
@@ -122,9 +125,10 @@ def get_test_complexity(dataset_path: str) -> list[dict]:
 
     Use this to identify tests that are structurally complex or have
     volatile ownership — both are risk indicators for failure.
+    Optional: pass test_ids (list of ints) to get profiles for specific tests only.
     """
     mode = get_mode()
     if mode == AgentMode.PILOT:
-        return _pilot_get_test_complexity(dataset_path)
+        return _pilot_get_test_complexity(dataset_path, test_ids=test_ids)
     else:
         return _production_get_test_complexity()

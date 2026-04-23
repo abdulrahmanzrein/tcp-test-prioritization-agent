@@ -1,4 +1,5 @@
 import json
+import logging
 import time
 import warnings
 
@@ -8,14 +9,14 @@ warnings.filterwarnings(
     category=Warning,
 )
 
+logger = logging.getLogger(__name__)
+
 from tcp_agent.tools.history_tool import get_test_history, get_all_failure_rates, get_execution_times, get_test_risk_profile
 from tcp_agent.tools.log_tool import get_failed_builds, get_build_failure_summary
 from tcp_agent.tools.dependency_tool import get_high_coverage_tests
 from tcp_agent.tools.complexity_tool import get_test_complexity
 from tcp_agent.tools.covered_code_risk_tool import get_covered_code_risk
 from tcp_agent.config import AgentMode, set_mode
-from tcp_agent.tools.complexity_tool import get_test_complexity
-from tcp_agent.tools.covered_code_risk_tool import get_covered_code_risk
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import AnyMessage, SystemMessage, ToolMessage, HumanMessage
 from typing_extensions import TypedDict, Annotated
@@ -190,16 +191,15 @@ def _invoke_with_retry(model, messages, max_retries=5):
     raise Exception(f"Still rate-limited after {max_retries} retries")
 
 
-# ── Main agent function ──────────────────────────────────────────────
+# ── Single-agent function (legacy, kept for benchmarking) ───────────
 
-def run_agent(dataset_path, mode: AgentMode = AgentMode.PILOT):
+def run_single_agent(dataset_path, mode: AgentMode = AgentMode.PILOT):
     # set global mode so tools know whether to read CSV or extract live
     set_mode(mode, dataset_path=dataset_path)
 
     model = init_chat_model(
-        "claude-haiku-4-5-20251001",
+        "gpt-4o-mini",
         temperature=0,
-        max_tokens=16384,
     )
 
     tools = [
@@ -212,7 +212,7 @@ def run_agent(dataset_path, mode: AgentMode = AgentMode.PILOT):
         get_test_risk_profile,
         get_test_complexity,
         get_covered_code_risk,
-    , get_test_complexity, get_covered_code_risk]
+    ]
     tools_by_name = {t.name: t for t in tools}
     model_with_tools = model.bind_tools(tools)
 
@@ -266,3 +266,98 @@ def run_agent(dataset_path, mode: AgentMode = AgentMode.PILOT):
     ])
 
     return [t.model_dump() for t in parsed.ranked_tests]
+
+
+# ── Multi-agent function (new default) ───────────────────────────────
+
+def run_multi_agent(
+    dataset_path,
+    mode: AgentMode = AgentMode.PILOT,
+    batch_size: int = 200,
+    filter_model: str = "gpt-4o-mini",
+    ranking_model: str = "gpt-4o",
+):
+    """Two-agent pipeline: Filter → Ranking → Validation.
+
+    1. Filter Agent classifies tests into T1-T5 (high-risk) vs T6 (low-signal)
+    2. Ranking Agent performs deep reasoning on only the high-risk subset
+    3. Validator checks output; deterministic fallback on failure
+    """
+    from tcp_agent.agent.filter_agent import run_filter_agent
+    from tcp_agent.agent.ranking_agent import run_ranking_agent
+    from tcp_agent.agent.validator import (
+        validate_ranking, deterministic_fallback, log_validation_errors,
+    )
+    from tcp_agent.tools.feature_extractor import extract_all_test_ids
+
+    set_mode(mode, dataset_path=dataset_path)
+
+    # ── Step 1: Filter ───────────────────────────────────────────────
+    logger.info("Starting Filter Agent (batch_size=%d, model=%s)", batch_size, filter_model)
+    filter_result = run_filter_agent(
+        dataset_path, batch_size=batch_size, filter_model=filter_model,
+    )
+    logger.info(filter_result.summary())
+
+    # ── Step 2: Rank ─────────────────────────────────────────────────
+    logger.info(
+        "Starting Ranking Agent (model=%s, high_risk=%d tests)",
+        ranking_model, len(filter_result.high_risk_tests),
+    )
+    ranked = run_ranking_agent(
+        filter_result, dataset_path, ranking_model=ranking_model,
+    )
+
+    # ── Step 3: Validate ─────────────────────────────────────────────
+    expected_ids = extract_all_test_ids(dataset_path)
+    validation = validate_ranking(ranked, expected_ids, filter_result)
+    logger.info(str(validation))
+
+    if validation.is_valid:
+        return ranked
+    else:
+        log_validation_errors(validation)
+        logger.warning("Falling back to deterministic ranker")
+        return deterministic_fallback(dataset_path)
+
+
+# ── Dispatcher (main entry point) ────────────────────────────────────
+
+def run_agent(
+    dataset_path,
+    mode: AgentMode = AgentMode.PILOT,
+    strategy: str = "multi",
+    batch_size: int = 200,
+    filter_model: str = "gpt-4o-mini",
+    ranking_model: str = "gpt-4o",
+):
+    """Run the TCP agent with the specified strategy.
+
+    Parameters
+    ----------
+    dataset_path : str
+        Path to the CSV dataset.
+    mode : AgentMode
+        PILOT (read from CSV) or PRODUCTION (extract from real sources).
+    strategy : str
+        'single' = original one-agent loop (legacy/benchmarking).
+        'multi'  = two-agent pipeline: Filter → Ranking → Validation (default).
+    batch_size : int
+        Number of tests per Filter Agent batch (only used in multi strategy).
+    filter_model : str
+        LLM model for the Filter Agent (only used in multi strategy).
+    ranking_model : str
+        LLM model for the Ranking Agent (only used in multi strategy).
+    """
+    if strategy == "single":
+        logger.info("Running single-agent strategy (legacy)")
+        return run_single_agent(dataset_path, mode=mode)
+    else:
+        logger.info("Running multi-agent strategy")
+        return run_multi_agent(
+            dataset_path,
+            mode=mode,
+            batch_size=batch_size,
+            filter_model=filter_model,
+            ranking_model=ranking_model,
+        )

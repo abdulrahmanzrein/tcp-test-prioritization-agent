@@ -1,0 +1,49 @@
+======================================================================
+DATASET SIZE
+======================================================================
+  Rows:    3,683
+  Columns: 154
+  Tests:   46
+  Builds:  124
+
+======================================================================
+TOOL OUTPUT SIZES (what gets sent to the LLM as ToolMessage)
+======================================================================
+Tool                            Records  Cols      Chars    ~Tokens
+----------------------------------------------------------------------
+get_covered_code_risk                46    82    177,254     44,313
+get_test_complexity                  46    38     58,264     14,566
+get_test_risk_profile                46    33     45,796     11,449
+get_execution_times                  46     2      2,274        568
+get_all_failure_rates                46     2      1,932        483
+get_high_coverage_tests              10     2        525        131
+get_failed_builds                     5     2        205         51
+----------------------------------------------------------------------
+TOTAL TOOL OUTPUT                                286,250     71,562
+System prompt                                      7,858      1,964
+GRAND TOTAL                                      294,108     73,527
+
+======================================================================
+REDUNDANCY ANALYSIS
+======================================================================
+
+get_test_risk_profile already includes:
+  - REC_TotalFailRate:     True (=> get_all_failure_rates is REDUNDANT)
+  - REC_RecentAvgExeTime:  True (=> get_execution_times is REDUNDANT)
+  - COV_ChnScoreSum:       True
+  - DET_COV_C_Faults:      True
+
+  Wasted tokens from redundant tools: ~1,051
+
+  get_covered_code_risk: 177,254 chars = 61% of all output
+  get_covered_code_risk -1 values: 1146/3726 = 30.8%
+  get_test_complexity -1 values: 0/1702 = 0.0%
+
+======================================================================
+RECOMMENDATIONS
+======================================================================
+1. DROP get_all_failure_rates - risk_profile has REC_TotalFailRate
+2. DROP get_execution_times - risk_profile has REC_RecentAvgExeTime
+3. STRIP -1 values from get_covered_code_risk and get_test_complexity
+4. Send only non-default feature values (sparse format)
+5. Consider top-N filtering for the massive tools

@@ -87,13 +87,16 @@ ALL_COLS = (
 )
 
 
-def _pilot_get_covered_code_risk(dataset_path: str) -> list[dict]:
+def _pilot_get_covered_code_risk(dataset_path: str, test_ids=None) -> list[dict]:
     """Pilot mode: read COD_COV_ features from the CSV."""
     df = pd.read_csv(dataset_path)
 
     # get the latest build for each test
     latest = df.sort_values("Build", ascending=False).groupby("Test").first()
     latest = latest.reset_index().copy()
+
+    if test_ids is not None:
+        latest = latest[latest["Test"].isin(test_ids)]
 
     keep_cols = ["Test"] + [c for c in ALL_COLS if c in latest.columns]
     result = latest[keep_cols].rename(columns={"Test": "test"})
@@ -137,7 +140,7 @@ def _production_get_covered_code_risk() -> list[dict]:
 
 
 @tool
-def get_covered_code_risk(dataset_path: str) -> list[dict]:
+def get_covered_code_risk(dataset_path: str, test_ids=None) -> list[dict]:
     """Get the risk profile of production code each test covers (81 features).
 
     Returns complexity, churn, and process metrics for the production code
@@ -158,9 +161,10 @@ def get_covered_code_risk(dataset_path: str) -> list[dict]:
     Tests covering complex, high-churn, multi-author production code are
     higher risk and should be prioritized. High COD_COV_COM_C_SumCyclomatic
     or COD_COV_CHN_C_LinesAdded values signal risky code under test.
+    Optional: pass test_ids (list of ints) to get profiles for specific tests only.
     """
     mode = get_mode()
     if mode == AgentMode.PILOT:
-        return _pilot_get_covered_code_risk(dataset_path)
+        return _pilot_get_covered_code_risk(dataset_path, test_ids=test_ids)
     else:
         return _production_get_covered_code_risk()

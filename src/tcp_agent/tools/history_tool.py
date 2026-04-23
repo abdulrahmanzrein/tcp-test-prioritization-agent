@@ -46,16 +46,20 @@ def get_execution_times(dataset_path):
 
 
 @tool
-def get_test_risk_profile(dataset_path):
-    """Get the most recent risk profile for every test using REC_ (execution history) and DET_COV_ (fault detection) features.
+def get_test_risk_profile(dataset_path, test_ids=None):
+    """Get the most recent risk profile for every test (or a subset) using REC_ (execution history) and DET_COV_ (fault detection) features.
     Returns each test's latest build snapshot with: recent/total failure rates, last verdict,
     transition rates, failure age, coverage fault counts, and change/impact coverage scores.
-    These are the strongest predictive signals — call this early to guide your ranking."""
+    These are the strongest predictive signals — call this early to guide your ranking.
+    Optional: pass test_ids (list of ints) to get profiles for specific tests only."""
     df = pd.read_csv(dataset_path)
 
     # get the latest build for each test — higher build id = more recent
     latest = df.sort_values("Build", ascending=False).groupby("Test").first()
     latest = latest.reset_index().copy()
+
+    if test_ids is not None:
+        latest = latest[latest["Test"].isin(test_ids)]
 
     # only grab the columns that actually matter for ranking
     keep_cols = [
