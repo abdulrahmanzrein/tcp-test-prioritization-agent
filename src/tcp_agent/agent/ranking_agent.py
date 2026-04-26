@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Ranking Agent — "The Expert"
 
@@ -108,48 +110,48 @@ Bad (too vague): "High failure rate, placing first."
 # ── LLM call with rate-limit retry ───────────────────────────────────
 
 def _invoke_with_retry(model, messages, max_retries=5):
+    last_error = None
     for attempt in range(max_retries):
         try:
             return model.invoke(messages)
         except Exception as e:
-            if "429" in str(e) or "rate_limit" in str(e).lower():
+            last_error = e
+            err = str(e).lower()
+            print(f"  [RETRY] Attempt {attempt+1}/{max_retries} failed: {type(e).__name__}: {e}")
+            if "429" in str(e) or "rate_limit" in err:
                 time.sleep(65)
+            elif "connection" in err or "ssl" in err or "read" in err or "timeout" in err:
+                time.sleep(10)
             else:
                 raise
-    raise Exception(f"Still rate-limited after {max_retries} retries")
+    raise Exception(f"Failed after {max_retries} retries. Last error: {last_error}")
 
 
 # ── Main ranking function ────────────────────────────────────────────
 
-def run_ranking_agent(
-    filter_result: FilterResult,
+def _chunk_list(lst: list, size: int) -> list[list]:
+    """Split a list into chunks of the given size."""
+    return [lst[i : i + size] for i in range(0, len(lst), size)]
+
+
+# Max tests per ranking batch — keeps tool output within GPT-4o's 128K context.
+# 3 tools × ~30 features × 50 tests ≈ 40K tokens, well within limits.
+_RANKING_BATCH_SIZE = 15
+
+
+def _rank_batch(
+    batch_tests: list[dict],
+    batch_ids: list[int],
     dataset_path: str,
-    ranking_model: str = "gpt-4o",
+    ranking_model: str,
+    total_high_risk: int,
+    total_tests: int,
+    low_signal_count: int,
 ) -> list[dict]:
-    """Run the Ranking Agent on the filtered high-risk tests.
+    """Rank a single batch of high-risk tests via the LLM tool-calling loop."""
 
-    Parameters
-    ----------
-    filter_result : FilterResult
-        Output from the Filter Agent.
-    dataset_path : str
-        Path to the CSV dataset (passed to tools).
-    ranking_model : str
-        LLM model name for the ranking agent (default gpt-4o).
-
-    Returns
-    -------
-    list[dict]
-        Full ranked list: high-risk tests with reasoning + T6 tail.
-    """
-    high_risk_ids = [t["test_id"] for t in filter_result.high_risk_tests]
-
-    # ── Short-circuit: if no high-risk tests, return T6 tail only ────
-    if not high_risk_ids:
-        return _build_t6_tail(filter_result.low_signal_tests, start_priority=1)
-
-    # ── Init model with tools ────────────────────────────────────────
-    model = init_chat_model(ranking_model, temperature=0)
+    provider = "google_genai" if "gemini" in ranking_model else None
+    model = init_chat_model(ranking_model, model_provider=provider, temperature=0)
 
     tools = [get_test_risk_profile, get_test_complexity, get_covered_code_risk]
     tools_by_name = {t.name: t for t in tools}
@@ -157,13 +159,13 @@ def run_ranking_agent(
 
     # ── Build context message with filter results ────────────────────
     filter_summary_lines = [
-        f"Pre-filtered {len(high_risk_ids)} high-risk tests (T1-T5) from "
-        f"{filter_result.metadata.get('total_tests', '?')} total tests.",
-        f"{filter_result.metadata.get('low_signal_count', '?')} T6 tests will be appended automatically.",
+        f"Ranking batch of {len(batch_ids)} high-risk tests (T1-T5) "
+        f"(out of {total_high_risk} total high-risk from {total_tests} tests).",
+        f"{low_signal_count} T6 tests will be appended automatically.",
         "",
         "High-risk test IDs and preliminary classifications:",
     ]
-    for t in filter_result.high_risk_tests:
+    for t in batch_tests:
         filter_summary_lines.append(
             f"  Test {t['test_id']}: preliminary T{t['tier']} — {', '.join(t['key_signals'])}"
         )
@@ -181,10 +183,9 @@ def run_ranking_agent(
         tool_results = []
         for tool_call in state["messages"][-1].tool_calls:
             tool = tools_by_name[tool_call["name"]]
-            # inject test_ids filter if the tool supports it
             args = dict(tool_call["args"])
             if "test_ids" not in args:
-                args["test_ids"] = high_risk_ids
+                args["test_ids"] = batch_ids
             result = tool.invoke(args)
             tool_results.append(
                 ToolMessage(content=str(result), tool_call_id=tool_call["id"])
@@ -196,7 +197,7 @@ def run_ranking_agent(
             return "call_tools"
         return END
 
-    # ── Build graph ──────────────────────────────────────────────────
+    # ── Build & run graph ────────────────────────────────────────────
     graph = StateGraph(AgentState)
     graph.add_node("call_llm", call_llm)
     graph.add_node("call_tools", call_tools)
@@ -205,13 +206,12 @@ def run_ranking_agent(
     graph.add_edge("call_tools", "call_llm")
     agent = graph.compile()
 
-    # ── Run the agent ────────────────────────────────────────────────
     result = agent.invoke({
         "messages": [HumanMessage(
             content=(
                 f"Rank these high-risk tests for the next build.\n"
                 f"Dataset: {dataset_path}\n"
-                f"High-risk test IDs (use these for tool calls): {high_risk_ids}\n\n"
+                f"High-risk test IDs (use these for tool calls): {batch_ids}\n\n"
                 f"{context}"
             )
         )]
@@ -228,14 +228,87 @@ def run_ranking_agent(
         HumanMessage(content=final_content),
     ])
 
-    ranked = [t.model_dump() for t in parsed.ranked_tests]
+    return [t.model_dump() for t in parsed.ranked_tests]
+
+
+def run_ranking_agent(
+    filter_result: FilterResult,
+    dataset_path: str,
+    ranking_model: str = "gpt-4o",
+) -> list[dict]:
+    """Run the Ranking Agent on the filtered high-risk tests.
+
+    Splits high-risk tests into batches to stay within model context limits.
+    Each batch is ranked independently, then results are merged by tier and
+    confidence to produce the final ordering.
+
+    Parameters
+    ----------
+    filter_result : FilterResult
+        Output from the Filter Agent.
+    dataset_path : str
+        Path to the CSV dataset (passed to tools).
+    ranking_model : str
+        LLM model name for the ranking agent (default gpt-4o).
+
+    Returns
+    -------
+    list[dict]
+        Full ranked list: high-risk tests with reasoning + T6 tail.
+    """
+    high_risk_tests = filter_result.high_risk_tests
+    high_risk_ids = [t["test_id"] for t in high_risk_tests]
+
+    # ── Short-circuit: if no high-risk tests, return T6 tail only ────
+    if not high_risk_ids:
+        return _build_t6_tail(filter_result.low_signal_tests, start_priority=1)
+
+    total_tests = filter_result.metadata.get("total_tests", len(high_risk_ids))
+    low_signal_count = filter_result.metadata.get("low_signal_count", 0)
+
+    # ── Batch the high-risk tests ────────────────────────────────────
+    test_batches = _chunk_list(high_risk_tests, _RANKING_BATCH_SIZE)
+    id_batches = _chunk_list(high_risk_ids, _RANKING_BATCH_SIZE)
+
+    print(f"  [RANKING] {len(high_risk_ids)} high-risk tests → {len(test_batches)} batches of ≤{_RANKING_BATCH_SIZE}")
+
+    all_ranked = []
+    for batch_idx, (batch_tests, batch_ids) in enumerate(zip(test_batches, id_batches)):
+        print(f"  [RANKING] Batch {batch_idx+1}/{len(test_batches)} ({len(batch_ids)} tests)...")
+        batch_ranked = _rank_batch(
+            batch_tests=batch_tests,
+            batch_ids=batch_ids,
+            dataset_path=dataset_path,
+            ranking_model=ranking_model,
+            total_high_risk=len(high_risk_ids),
+            total_tests=total_tests,
+            low_signal_count=low_signal_count,
+        )
+        all_ranked.extend(batch_ranked)
+
+    # ── Merge: sort by tier (from reason) then confidence desc ───────
+    def _sort_key(item):
+        # extract tier number from reason string (e.g. "Tier 1 ..." → 1)
+        reason = item.get("reason", "")
+        tier = 6
+        for t in range(1, 7):
+            if f"Tier {t}" in reason or f"T{t}" in reason:
+                tier = t
+                break
+        return (tier, -item.get("confidence", 0))
+
+    all_ranked.sort(key=_sort_key)
+
+    # ── Re-number priorities sequentially ────────────────────────────
+    for i, item in enumerate(all_ranked):
+        item["priority"] = i + 1
 
     # ── Append T6 tail ───────────────────────────────────────────────
-    next_priority = len(ranked) + 1
+    next_priority = len(all_ranked) + 1
     t6_tail = _build_t6_tail(filter_result.low_signal_tests, start_priority=next_priority)
-    ranked.extend(t6_tail)
+    all_ranked.extend(t6_tail)
 
-    return ranked
+    return all_ranked
 
 
 def _build_t6_tail(low_signal_tests: list[dict], start_priority: int) -> list[dict]:

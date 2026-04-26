@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Filter Agent — "The Scanner"
 
@@ -16,6 +18,9 @@ Design
 import json
 import math
 import time
+import warnings
+
+warnings.filterwarnings("ignore", message=r"Pydantic serializer warnings")
 
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -94,8 +99,11 @@ def _invoke_with_retry(model, messages, max_retries=5):
         try:
             return model.invoke(messages)
         except Exception as e:
-            if "429" in str(e) or "rate_limit" in str(e).lower():
+            err = str(e).lower()
+            if "429" in str(e) or "rate_limit" in err:
                 time.sleep(65)
+            elif "connection" in err or "ssl" in err or "read" in err or "timeout" in err:
+                time.sleep(10)
             else:
                 raise
     raise Exception(f"Still rate-limited after {max_retries} retries")
@@ -161,7 +169,8 @@ def run_filter_agent(
     batches = _chunk(risk_profiles, batch_size)
 
     # ── 2. Init LLM with structured output ───────────────────────────
-    model = init_chat_model(filter_model, temperature=0)
+    provider = "google_genai" if "gemini" in filter_model else None
+    model = init_chat_model(filter_model, model_provider=provider, temperature=0)
     structured_model = model.with_structured_output(BatchClassificationResult)
 
     # ── 3. Process each batch ────────────────────────────────────────

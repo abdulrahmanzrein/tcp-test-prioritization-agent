@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import logging
 import time
@@ -184,11 +186,14 @@ def _invoke_with_retry(model, messages, max_retries=5):
         try:
             return model.invoke(messages)
         except Exception as e:
-            if "429" in str(e) or "rate_limit" in str(e).lower():
+            err = str(e).lower()
+            if "429" in str(e) or "rate_limit" in err:
                 time.sleep(65)
+            elif "connection" in err or "ssl" in err or "read" in err or "timeout" in err:
+                time.sleep(10)
             else:
                 raise
-    raise Exception(f"Still rate-limited after {max_retries} retries")
+    raise Exception(f"Failed after {max_retries} retries")
 
 
 # ── Single-agent function (legacy, kept for benchmarking) ───────────

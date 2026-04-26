@@ -4,9 +4,17 @@ import sys
 import time
 import tempfile
 from pathlib import Path
+from dotenv import load_dotenv
+import logging
+import warnings
+
+logging.basicConfig(level=logging.INFO)
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", message=r"urllib3 v2 only supports OpenSSL")
 
 # Ensure src/ is importable when running this file directly.
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(PROJECT_ROOT / ".env")
 SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))

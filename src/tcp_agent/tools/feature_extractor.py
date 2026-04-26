@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Pure-Python feature extraction for the Filter Agent.
 
