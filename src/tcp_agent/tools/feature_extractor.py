@@ -14,6 +14,8 @@ LLM in batches.
 import pandas as pd
 from typing import Optional
 
+from tcp_agent.data_cache import load_dataset
+
 
 # ── Risk profile features (REC_ + DET_COV_ + COV_ + TES_CHN_) ────────
 
@@ -58,7 +60,11 @@ def extract_risk_profiles(
     dataset_path : str
         Path to the CSV dataset.
     sparse : bool
-        If True, omit keys whose value is -1 or 0 to reduce token usage.
+        If True, omit keys whose value is -1 (the TCP-CI "no data" sentinel).
+        Real-zero values are KEPT because they carry meaningful signal — e.g.,
+        REC_LastVerdict=0 ("passed last build"), REC_LastFailureAge=0 ("failed
+        in current build"), REC_TotalFailRate=0 ("never failed"). Conflating
+        these with "no data" causes the Filter Agent to misclassify tests.
     test_ids : list[int] | None
         If provided, only extract profiles for these test IDs.
 
@@ -67,7 +73,7 @@ def extract_risk_profiles(
     list[dict]
         One dict per test, keyed by feature name.
     """
-    df = pd.read_csv(dataset_path)
+    df = load_dataset(dataset_path)
 
     # latest build snapshot per test
     latest = (
@@ -87,8 +93,9 @@ def extract_risk_profiles(
     records = result.to_dict("records")
 
     if sparse:
+        # Only drop -1 (TCP-CI "no data" sentinel). Keep 0s — they're real signal.
         records = [
-            {k: v for k, v in rec.items() if k == "test" or (v != -1 and v != 0)}
+            {k: v for k, v in rec.items() if k == "test" or v != -1}
             for rec in records
         ]
 
@@ -97,7 +104,7 @@ def extract_risk_profiles(
 
 def extract_failure_rates(dataset_path: str) -> dict:
     """Return {test_id: failure_rate} mapping for every test."""
-    df = pd.read_csv(dataset_path)
+    df = load_dataset(dataset_path)
     rates = (
         df.assign(_fail=df["Verdict"].ne(0))
         .groupby("Test")["_fail"]
@@ -108,14 +115,14 @@ def extract_failure_rates(dataset_path: str) -> dict:
 
 def extract_exec_times(dataset_path: str) -> dict:
     """Return {test_id: avg_exec_time} mapping for every test."""
-    df = pd.read_csv(dataset_path)
+    df = load_dataset(dataset_path)
     times = df.groupby("Test")["Duration"].mean()
     return times.to_dict()
 
 
 def extract_all_test_ids(dataset_path: str) -> set:
     """Return the set of all unique test IDs in the dataset."""
-    df = pd.read_csv(dataset_path)
+    df = load_dataset(dataset_path)
     return set(df["Test"].unique().tolist())
 
 
@@ -127,7 +134,7 @@ def extract_latest_features_for_fallback(dataset_path: str) -> pd.DataFrame:
         Test, REC_TotalFailRate, REC_RecentFailRate, DET_COV_C_Faults,
         DET_COV_IMP_Faults, REC_RecentAvgExeTime
     """
-    df = pd.read_csv(dataset_path)
+    df = load_dataset(dataset_path)
     latest = (
         df.sort_values("Build", ascending=False)
         .groupby("Test")

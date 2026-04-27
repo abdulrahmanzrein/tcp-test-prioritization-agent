@@ -94,13 +94,22 @@ T6 — Low-signal remainder:  none of the above
 
 # ── Helper: LLM call with retry ──────────────────────────────────────
 
+def _resolve_provider(model_name: str) -> str | None:
+    name = model_name.lower()
+    if "gemini" in name:
+        return "google_genai"
+    if name.startswith("claude"):
+        return "anthropic"
+    return None
+
+
 def _invoke_with_retry(model, messages, max_retries=5):
     for attempt in range(max_retries):
         try:
             return model.invoke(messages)
         except Exception as e:
             err = str(e).lower()
-            if "429" in str(e) or "rate_limit" in err:
+            if "429" in str(e) or "rate_limit" in err or "overloaded" in err:
                 time.sleep(65)
             elif "connection" in err or "ssl" in err or "read" in err or "timeout" in err:
                 time.sleep(10)
@@ -169,7 +178,7 @@ def run_filter_agent(
     batches = _chunk(risk_profiles, batch_size)
 
     # ── 2. Init LLM with structured output ───────────────────────────
-    provider = "google_genai" if "gemini" in filter_model else None
+    provider = _resolve_provider(filter_model)
     model = init_chat_model(filter_model, model_provider=provider, temperature=0)
     structured_model = model.with_structured_output(BatchClassificationResult)
 

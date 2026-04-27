@@ -17,6 +17,7 @@ Design
 
 import time
 import operator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import AnyMessage, SystemMessage, ToolMessage, HumanMessage
@@ -109,6 +110,15 @@ Bad (too vague): "High failure rate, placing first."
 
 # ── LLM call with rate-limit retry ───────────────────────────────────
 
+def _resolve_provider(model_name: str) -> str | None:
+    name = model_name.lower()
+    if "gemini" in name:
+        return "google_genai"
+    if name.startswith("claude"):
+        return "anthropic"
+    return None
+
+
 def _invoke_with_retry(model, messages, max_retries=5):
     last_error = None
     for attempt in range(max_retries):
@@ -118,7 +128,7 @@ def _invoke_with_retry(model, messages, max_retries=5):
             last_error = e
             err = str(e).lower()
             print(f"  [RETRY] Attempt {attempt+1}/{max_retries} failed: {type(e).__name__}: {e}")
-            if "429" in str(e) or "rate_limit" in err:
+            if "429" in str(e) or "rate_limit" in err or "overloaded" in err:
                 time.sleep(65)
             elif "connection" in err or "ssl" in err or "read" in err or "timeout" in err:
                 time.sleep(10)
@@ -135,8 +145,15 @@ def _chunk_list(lst: list, size: int) -> list[list]:
 
 
 # Max tests per ranking batch — keeps tool output within GPT-4o's 128K context.
-# 3 tools × ~30 features × 50 tests ≈ 40K tokens, well within limits.
-_RANKING_BATCH_SIZE = 15
+# 3 tools × ~30 features × 30 tests ≈ 25K tokens, well within limits.
+# Going larger trades a bit of LLM ranking-precision risk for fewer round trips.
+_RANKING_BATCH_SIZE = 30
+
+# How many ranking batches to run concurrently across threads.  Each batch is
+# an independent LangGraph instance with its own model/tools, so it's safe to
+# parallelize.  Limit set to keep token-rate within OpenAI Tier 1+ TPM bands;
+# raise to 6-8 on higher tiers, lower to 2 on rate-limited providers.
+_RANKING_PARALLELISM = 4
 
 
 def _rank_batch(
@@ -150,7 +167,7 @@ def _rank_batch(
 ) -> list[dict]:
     """Rank a single batch of high-risk tests via the LLM tool-calling loop."""
 
-    provider = "google_genai" if "gemini" in ranking_model else None
+    provider = _resolve_provider(ranking_model)
     model = init_chat_model(ranking_model, model_provider=provider, temperature=0)
 
     tools = [get_test_risk_profile, get_test_complexity, get_covered_code_risk]
@@ -270,11 +287,14 @@ def run_ranking_agent(
     test_batches = _chunk_list(high_risk_tests, _RANKING_BATCH_SIZE)
     id_batches = _chunk_list(high_risk_ids, _RANKING_BATCH_SIZE)
 
-    print(f"  [RANKING] {len(high_risk_ids)} high-risk tests → {len(test_batches)} batches of ≤{_RANKING_BATCH_SIZE}")
+    print(
+        f"  [RANKING] {len(high_risk_ids)} high-risk tests → {len(test_batches)} "
+        f"batches of ≤{_RANKING_BATCH_SIZE} (parallelism={_RANKING_PARALLELISM})"
+    )
 
-    all_ranked = []
-    for batch_idx, (batch_tests, batch_ids) in enumerate(zip(test_batches, id_batches)):
-        print(f"  [RANKING] Batch {batch_idx+1}/{len(test_batches)} ({len(batch_ids)} tests)...")
+    def _run_one_batch(batch_idx: int, batch_tests, batch_ids):
+        """Worker: rank a single batch and tag every result with its batch_idx."""
+        print(f"  [RANKING] Batch {batch_idx+1}/{len(test_batches)} ({len(batch_ids)} tests) starting...")
         batch_ranked = _rank_batch(
             batch_tests=batch_tests,
             batch_ids=batch_ids,
@@ -284,20 +304,42 @@ def run_ranking_agent(
             total_tests=total_tests,
             low_signal_count=low_signal_count,
         )
-        all_ranked.extend(batch_ranked)
+        for item in batch_ranked:
+            item["_batch_idx"] = batch_idx
+        print(f"  [RANKING] Batch {batch_idx+1}/{len(test_batches)} done ({len(batch_ranked)} ranked)")
+        return batch_ranked
 
-    # ── Merge: sort by tier (from reason) then confidence desc ───────
+    all_ranked = []
+    if len(test_batches) == 1 or _RANKING_PARALLELISM <= 1:
+        # Avoid thread overhead for the trivial case
+        for batch_idx, (batch_tests, batch_ids) in enumerate(zip(test_batches, id_batches)):
+            all_ranked.extend(_run_one_batch(batch_idx, batch_tests, batch_ids))
+    else:
+        with ThreadPoolExecutor(max_workers=_RANKING_PARALLELISM) as pool:
+            futures = {
+                pool.submit(_run_one_batch, idx, bt, bi): idx
+                for idx, (bt, bi) in enumerate(zip(test_batches, id_batches))
+            }
+            for fut in as_completed(futures):
+                idx = futures[fut]
+                try:
+                    all_ranked.extend(fut.result())
+                except Exception as e:
+                    # One failed batch shouldn't kill the whole dataset — log and
+                    # continue.  These tests will be missing from the ranking and
+                    # will be appended at max-priority by build_ranked_df.
+                    print(f"  [RANKING] Batch {idx+1} FAILED: {type(e).__name__}: {e}")
+
+    # ── Merge: trust the LLM's structured `priority` field within each batch,
+    #    and preserve batch order across batches.  Earlier batches contain
+    #    higher-failure-rate tests (feature_extractor sorts risk_profiles by
+    #    REC_RecentFailRate desc before chunking), so batch order is meaningful.
     def _sort_key(item):
-        # extract tier number from reason string (e.g. "Tier 1 ..." → 1)
-        reason = item.get("reason", "")
-        tier = 6
-        for t in range(1, 7):
-            if f"Tier {t}" in reason or f"T{t}" in reason:
-                tier = t
-                break
-        return (tier, -item.get("confidence", 0))
+        return (item["_batch_idx"], item.get("priority", 10**6))
 
     all_ranked.sort(key=_sort_key)
+    for item in all_ranked:
+        item.pop("_batch_idx", None)
 
     # ── Re-number priorities sequentially ────────────────────────────
     for i, item in enumerate(all_ranked):
