@@ -1,5 +1,6 @@
-import pandas as pd
 from langchain_core.tools import tool
+
+from tcp_agent.data_cache import load_dataset
 
 # NOTE: these tools were removed from the active toolset.
 # get_tests_for_changed_files is broken — the dataset uses numeric test IDs, not named tests,
@@ -17,7 +18,7 @@ def get_tests_for_changed_files(dataset_path, changed_files):
     # NOTE: this dataset uses numeric test IDs not named tests so file matching won't work here.
     # the agent still ranks effectively using failure rate and recent build history instead.
 
-    df = pd.read_csv(dataset_path)
+    df = load_dataset(dataset_path)
     all_tests = df["Test"].unique().tolist() #create a list to store all test names
 
     matched_tests = []
@@ -36,7 +37,7 @@ def get_tests_for_changed_files(dataset_path, changed_files):
 @tool
 def get_high_coverage_tests(dataset_path, n=10):
     """Get the top n tests with the highest code coverage scores. Tests that cover more code are more likely to catch regressions. Use this to find high-value safety-net tests."""
-    df = pd.read_csv(dataset_path)
+    df = load_dataset(dataset_path)
 
     covered_cols = df.filter(like="COV_")
 

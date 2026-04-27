@@ -1,10 +1,12 @@
-import pandas as pd
 from langchain_core.tools import tool
+
+from tcp_agent.data_cache import load_dataset
+
 
 @tool
 def get_test_history(dataset_path, test_name):
     """Look up a single test's history. Returns how many builds it ran in and what percentage of those it failed. Use this to drill into a specific test you're suspicious about."""
-    df = pd.read_csv(dataset_path)
+    df = load_dataset(dataset_path)
     test_df = df[df["Test"] == test_name]
 
     if test_df.empty:
@@ -22,7 +24,7 @@ def get_test_history(dataset_path, test_name):
 @tool
 def get_all_failure_rates(dataset_path):
     """Get every test in the dataset ranked by historical failure rate. Returns all tests with their failure rate (0.0 to 1.0). Use this first to get the full picture of which tests fail the most."""
-    df = pd.read_csv(dataset_path)
+    df = load_dataset(dataset_path)
 
     failure_rates = (
         df.assign(_fail=df["Verdict"].ne(0))
@@ -38,7 +40,7 @@ def get_all_failure_rates(dataset_path):
 @tool
 def get_execution_times(dataset_path):
     """Get average execution time for every test. Returns all tests sorted by duration (slowest first). Use this to factor in test cost — fast tests that might fail should run before slow ones."""
-    df = pd.read_csv(dataset_path)
+    df = load_dataset(dataset_path)
     exec_times = df.groupby("Test")["Duration"].mean().reset_index()
     exec_times.columns = ["test", "avg_duration"]
     exec_times = exec_times.sort_values("avg_duration", ascending=False)
@@ -52,7 +54,7 @@ def get_test_risk_profile(dataset_path, test_ids=None):
     transition rates, failure age, coverage fault counts, and change/impact coverage scores.
     These are the strongest predictive signals — call this early to guide your ranking.
     Optional: pass test_ids (list of ints) to get profiles for specific tests only."""
-    df = pd.read_csv(dataset_path)
+    df = load_dataset(dataset_path)
 
     # get the latest build for each test — higher build id = more recent
     latest = df.sort_values("Build", ascending=False).groupby("Test").first()

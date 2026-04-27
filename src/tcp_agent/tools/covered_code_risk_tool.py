@@ -7,9 +7,10 @@ Production mode: Extracts via SciTools Understand + pydriller (matches TCP-CI's
                  DatasetFactory.compute_cod_cov_features).
 """
 
-import pandas as pd
 from langchain_core.tools import tool
+
 from tcp_agent.config import get_mode, get_config, AgentMode
+from tcp_agent.data_cache import load_dataset
 
 # ── Feature column definitions ───────────────────────────────────────
 # Mirrors TCP-CI Feature class exactly
@@ -89,7 +90,7 @@ ALL_COLS = (
 
 def _pilot_get_covered_code_risk(dataset_path: str, test_ids=None) -> list[dict]:
     """Pilot mode: read COD_COV_ features from the CSV."""
-    df = pd.read_csv(dataset_path)
+    df = load_dataset(dataset_path)
 
     # get the latest build for each test
     latest = df.sort_values("Build", ascending=False).groupby("Test").first()

@@ -8,9 +8,10 @@ Production mode: Extracts complexity via SciTools Understand and process
                  DatasetFactory.compute_tes_features).
 """
 
-import pandas as pd
 from langchain_core.tools import tool
+
 from tcp_agent.config import get_mode, get_config, AgentMode
+from tcp_agent.data_cache import load_dataset
 
 # ── Feature column definitions ───────────────────────────────────────
 # Mirrors TCP-CI Feature class exactly
@@ -66,7 +67,7 @@ ALL_COLS = TES_COM_COLS + TES_PRO_COLS  # 37 total
 
 def _pilot_get_test_complexity(dataset_path: str, test_ids=None) -> list[dict]:
     """Pilot mode: read TES_COM_ + TES_PRO_ features from the CSV."""
-    df = pd.read_csv(dataset_path)
+    df = load_dataset(dataset_path)
 
     # get the latest build for each test (same pattern as get_test_risk_profile)
     latest = df.sort_values("Build", ascending=False).groupby("Test").first()

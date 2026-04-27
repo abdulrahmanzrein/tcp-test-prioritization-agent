@@ -1,9 +1,9 @@
-import pandas as pd
+from tcp_agent.data_cache import load_dataset
 
 
 #load the file into a pandas dataframe
 def load_data(file_path):
-    df = pd.read_csv(file_path)
+    df = load_dataset(file_path)
     print(f"Loaded {len(df)} rows, {len(df.columns)} columns from {file_path}") 
     return df
 
