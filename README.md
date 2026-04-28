@@ -1,230 +1,153 @@
 # TCP Test Prioritization Agent
 
-Undergrad research project exploring whether an LLM can replace trained ML models for test case prioritization (TCP) in Continuous Integration. The agent (Claude Haiku 4.5 via LangGraph) reads ~150 pre-extracted features through tools and ranks regression tests by failure likelihood -- no model training, no manual feature engineering.
-
-Built on the **TCP-CI** framework and dataset from Yaraghi et al. (2022), validated against 25 open-source Java projects. Compared against a traditional Random Forest baseline trained on the same features.
+LLM-driven **test case prioritization (TCP)** for **Continuous Integration**, evaluated on the **TCP-CI** CSV benchmarks (Yaraghi et al., IEEE TSE 2022). The pipeline uses **two LLM stages** plus validation—no training step for the LLM path (a separate **Random Forest** script exists for baseline comparison).
 
 ---
 
-## Research Foundation
+## What this repo does
 
-This project is grounded in two papers:
+1. **Filter Agent** — Classifies every test into **T1–T5** (high-risk) or **T6** (low-signal) using structured output and batched prompts. Features come from **`feature_extractor`** (pure Python on the CSV), not tool calls.
+2. **Ranking Agent** — For **T1–T5 only**, runs a **LangGraph** tool loop (`get_test_risk_profile`, `get_test_complexity`, `get_covered_code_risk`), then structured extraction of the final ordering. **T6** is appended deterministically (by average execution time).
+3. **Validator** — Checks completeness / IDs / duplicates; on failure, **`deterministic_fallback`** produces a valid ranking from latest CSV rows.
 
-1. **Yaraghi et al. (2022)** -- *"Scalable and Accurate Test Case Prioritization in Continuous Integration Contexts"*
-   - Established the TCP-CI dataset: 25 Java projects, 150+ features across 9 groups
-   - Key finding: execution history features (REC) dominate -- REC alone achieves near-full-model APFDc (CL=0.51 vs Full_M)
-   - Feature importance (Table 12): REC_Age (#1, freq 17,034), TES_PRO_OwnersExperience (#2, freq 10,618), TES_PRO_AllCommitersExperience (#3, freq 7,643)
-   - Coverage features (COV/COD_COV) have lowest marginal value (CL=0.79 vs Full_M)
-   - Random Forest pairwise ranking achieves APFDc ~0.82
-
-2. **Mendoza et al. (2022)** -- *"On the Effectiveness of Data Balancing Techniques in ML-Based TCP"*
-   - Only ~3% of test executions fail in typical CI projects -- extreme class imbalance
-   - SMOTE/Random Over-sampling improve APFDc by avg 0.06 on the same TCP-CI dataset
-
-Our agent uses these findings to define a research-grounded tiered ranking strategy that prioritizes REC features, uses TES_PRO experience metrics for tiebreaking, and treats coverage as a low-weight signal -- matching the empirical feature importance hierarchy from the papers.
+Research context: **Yaraghi et al. (TCP-CI)** — comprehensive features and REC-heavy importance; **Mendoza et al. (PROMISE ’22)** — imbalance and APFDc-focused ML-TCP (your LLM path does not apply SMOTE; the RF baseline does).
 
 ---
 
-## Quick Start
+## Requirements
+
+- Python 3.10+ (recommended)
+- API keys in **`.env`** at the project root (loaded by `run_llm_agent.py`):
+
+| Models you use | Set |
+|----------------|-----|
+| OpenAI (`gpt-4o`, `gpt-4o-mini`, …) | `OPENAI_API_KEY` |
+| Anthropic (`claude-…`) | `ANTHROPIC_API_KEY` |
+| Google Gemini (`…gemini…`) | `GOOGLE_API_KEY` |
+
+`run_llm_agent.py` inspects **`--filter-model`** and **`--ranking-model`** and requires every provider key implied by those names.
 
 ```bash
 python3 -m venv venv
-source venv/bin/activate
+source venv/bin/activate   # Windows: venv\Scripts\activate
 pip install -r requirements.txt
-
-export ANTHROPIC_API_KEY="your-key-here"   # from console.anthropic.com
-
-# single dataset
-python scripts/run_llm_agent.py --data datasets/Angel-ML@angel.csv
-
-# all 25 datasets (batch)
-python scripts/run_llm_agent.py --data-dir datasets/ --quiet
-
-# ML baseline (no API key needed)
-python scripts/run_agent.py --data datasets/Angel-ML@angel.csv
 ```
 
 ---
 
-## How It Works
+## Main entry point: `scripts/run_llm_agent.py`
 
-The agent runs in a **LangGraph loop** -- Claude (Haiku 4.5) picks which tools to call, reads the results, and repeats until it has enough data to rank every test. The ranking is then extracted via structured output (Pydantic schema) to guarantee valid JSON.
+Rolling **evaluation**: for each of the last **`--eval-window`** builds, the agent sees only **history** (`Build < target`), writes it to a temp CSV, runs **`run_agent`** on that file, then scores the predicted order against the **target** build’s `Verdict` / `Duration` (**APFD**, **APFDc**, **P@10**).
 
-```
-"prioritize tests for the next build"
-     |
-     v
-+-----------------------------------+
-|       LangGraph Agent Loop        |
-|                                   |
-|  Claude picks tools -> reads      |
-|  results -> picks more -> done    |
-|                                   |
-|  4 tools:                         |
-|   - get_test_risk_profile         |
-|   - get_all_failure_rates         |
-|   - get_test_complexity           |
-|   - get_covered_code_risk         |
-+-----------------------------------+
-     |
-     v
-Structured output (Pydantic schema)
-     |
-     v
-Ranked JSON with reasons per test
-```
+### CLI reference
 
-The system prompt instructs Claude to call `get_test_risk_profile` and `get_all_failure_rates` in parallel first, then `get_test_complexity` and `get_covered_code_risk` in parallel -- getting all ~150 features in 2 tool rounds.
+| Argument | Default | Role |
+|----------|---------|------|
+| `--data` *path* | (one required) | Single dataset CSV |
+| `--data-dir` *path* | mutually exclusive with `--data` | All `*.csv` in folder |
+| `--mode` | `pilot` | `pilot` = CSV pilot; `production` hooks (see `config.py`) |
+| `--batch-size` | `100` | Tests per **Filter** LLM batch (auto-splits on length errors) |
+| `--filter-model` | `gpt-4o-mini` | Filter LLM id |
+| `--ranking-model` | `gpt-4o` | Ranking LLM id |
+| `--eval-window` | `5` | Number of most recent builds to average metrics over |
+| `--gap` | `65` | Seconds to sleep between full agent runs per build (`0` disables) |
+| `--workers` | `1` | Parallel **datasets** when using `--data-dir` (raises API load) |
+| `--results-csv` | `results/evaluation_summary.csv` | Append metrics; **resume** skips datasets already listed |
+| `--quiet` | off | Less console output for single `--data` runs |
 
-Evaluation uses **per-build splitting**: the most recent build is held out as the target, and the agent only sees historical builds. This simulates a real CI scenario where you're predicting which tests will fail in the *next* build.
-
----
-
-## Feature Groups (~150 features)
-
-The TCP-CI dataset (Yaraghi et al., Table 3) defines 9 feature groups. Our tools expose all of them:
-
-| Tool | Feature Groups | Count | Key Features |
-|------|---------------|-------|-------------|
-| `get_test_risk_profile` | REC (execution history) + DET_COV (fault detection) + COV (coverage) + TES_CHN (test churn) | 32 | `REC_Age`, `REC_RecentFailRate`, `REC_TotalFailRate`, `REC_LastVerdict`, `DET_COV_C_Faults`, `COV_ChnScoreSum` |
-| `get_all_failure_rates` | Derived from Verdict history | 1 | `failure_rate` |
-| `get_test_complexity` | TES_COM (test complexity) + TES_PRO (test process) | 37 | `TES_COM_SumCyclomatic`, `TES_COM_MaxNesting`, `TES_PRO_CommitCount`, `TES_PRO_OwnersExperience` |
-| `get_covered_code_risk` | COD_COV_COM + COD_COV_PRO + COD_COV_CHN (covered code) | 81 | `COD_COV_COM_C_SumCyclomatic`, `COD_COV_CHN_C_LinesAdded`, `COD_COV_PRO_C_DistinctDevCount` |
-
-**Why REC-heavy?** Yaraghi et al. RQ2.3 shows REC_M alone vs Full_M has CL=0.51 -- the full model barely outperforms REC-only. Coverage features (COV_M) have CL=0.79 vs Full_M -- they lose ~79% of comparisons. Our tier system reflects this: REC-based tiers (T1, T2, T4) outrank coverage-based tiers (T3, T5).
-
-### Feature Definitions from the Papers
-
-- **REC_Age** (Section 2.2): Number of builds since the test first appeared. The #1 most-used feature in RF models. Older tests have more historical signal.
-- **COV_ChnScoreSum** (Section 2.2, Definition 1): Not traditional code coverage -- uses association-rule mining to measure co-change confidence between test and production files.
-- **DET_COV_C_Faults** (Section 2.2, Definition 2): Previously Detected Faults -- count of known bugs in production code the test covers. Buggy code tends to stay buggy.
-- **TES_PRO_OwnersExperience** (Table 12): Primary author's contribution proportion. Low values indicate inexperienced ownership -- the #2 most important feature overall.
-- **TES_CHN_DMM\*** (Section 2.2): Delta Maintainability Model metrics measuring recent changes to test file size, complexity, and interface.
-
----
-
-## Tiered Ranking Strategy
-
-The system prompt defines a strict priority order grounded in the papers' findings. The optimal ordering from Yaraghi et al. Section 2.1: *"test cases are first sorted by their verdict with failed test cases at the beginning, second sorted by execution time ascending."*
-
-| Tier | Rule | Research Basis |
-|------|------|---------------|
-| **T1 -- Persistent failures** | `REC_TotalFailRate >= 0.9`. Cheapest first. | Near-guaranteed failures. Fastest detection at minimal CI cost. |
-| **T2 -- Recent/active failures** | `REC_RecentFailRate > 0` AND `REC_LastVerdict = 1`. Sort by fail rate desc, then cost asc. | Actively broken tests. "Recent" = last 6 builds (Yaraghi Section 2.2). |
-| **T3 -- Fault-adjacent** | `DET_COV_C_Faults > 0` OR `DET_COV_IMP_Faults > 0`. Prefer with `COV_ChnScoreSum > 0`. | Previously Detected Faults (Definition 2). Changed buggy code = highest risk. |
-| **T4 -- Historical failures** | `failure_rate > 0` but `REC_RecentFailRate = 0`. Sort by rate desc, factor in `owners_experience`. | Past failures + low ownership experience (#2 feature) = regression risk. |
-| **T5 -- High-signal, never failed** | `COV_ChnScoreSum > 0`, high complexity, low experience, or high `covered_code_risk_score`. | Risk indicators without failure history. Coverage as tiebreaker (CL=0.79). |
-| **T6 -- Low-signal remainder** | No failure history, no risk signal. Cheapest first. | ~97% of tests never fail (Mendoza et al.). Minimize wasted CI time. |
-
----
-
-## Evaluation Metrics
-
-| Metric | Definition | Source |
-|--------|-----------|--------|
-| **APFD** | How early failures appear in the ranking (0-1, random ~ 0.5) | Rothermel et al. (1999) |
-| **APFDc** | Cost-cognizant APFD -- weighted by test execution time. Finding failures in fast tests scores higher. | Yaraghi et al. Section 4.3 |
-| **Precision@10** | Of the top 10 ranked tests, how many actually failed? | Standard IR metric |
-
-APFDc is the primary metric, matching Yaraghi et al. and Mendoza et al. evaluation methodology.
-
----
-
-## ML Baseline (Random Forest)
-
-The RF baseline (`scripts/run_agent.py`) trains a Random Forest classifier on the same ~150 features for comparison:
-
-- **SMOTE** for class balancing (~3% failure rate, justified by Mendoza et al.)
-- 80/20 train/test split with `random_state=7`
-- Ranks tests by predicted failure probability
-
-Note: this uses a random split, not the walk-forward protocol from the papers. The paper's RF uses pairwise ranking trained per-build. Our simplified RF is included for reproducible comparison, not as an exact replication of their model.
+### Commands
 
 ```bash
-python scripts/run_agent.py --data datasets/Angel-ML@angel.csv
+# One dataset (prints mean APFD / APFDc / P@10)
+python3 scripts/run_llm_agent.py --data datasets/apache@rocketmq.csv --eval-window 5 --ranking-model gpt-4o
+
+# All CSVs in datasets/ (sequential unless --workers > 1)
+python3 scripts/run_llm_agent.py --data-dir datasets/ --eval-window 5 --ranking-model gpt-4o --quiet
+
+# Long run with log
+python3 scripts/run_llm_agent.py --data-dir datasets/ --eval-window 5 2>&1 | tee run_output.log
 ```
+
+### Results file (`--results-csv`)
+
+Append-only **CSV** columns: `dataset`, `apfd`, `apfdc`, `p_at_10`, `filter_model`, `ranking_model`, `eval_window`, `wall_seconds`, `timestamp`, `status`, `error`. Each completed dataset is one row (`fsync` after write). Rerun the same command to **resume** unfinished batches.
 
 ---
 
-## Running All 25 Datasets
+## ML baseline: `scripts/run_agent.py`
 
-The `datasets/` folder contains CSVs from 25 open-source Java projects (TCP-CI benchmark):
+Trains a **Random Forest** on a random **80/20** split (see `model.py` / `features.py`), ranks the holdout by predicted failure probability, prints **APFD**, **APFDc**, **Precision@10**. **No API key.** Not the same walk-forward protocol as the TCP-CI papers; useful as a quick local baseline.
 
 ```bash
-# LLM agent (requires API key)
-python scripts/run_llm_agent.py --data-dir datasets/ --quiet
-
-# ML baseline (local, no API key)
-python scripts/run_agent.py --data datasets/Angel-ML@angel.csv
+python3 scripts/run_agent.py --data datasets/Angel-ML@angel.csv
 ```
 
-Output:
-```
-[1/25] Angel-ML@angel.csv       APFD=0.8600  APFDc=0.9327  P@10=0.7000
-[2/25] CompEvol@beast2.csv       APFD=...     APFDc=...     P@10=...
-...
-```
-
-Options:
-- `--quiet` -- suppress per-test rankings, just print metrics
-- `--gap 65` -- seconds between runs to stay under API rate limits (default 65)
+(`sys.path` is adjusted so this works without `PYTHONPATH`.)
 
 ---
 
-## Project Structure
+## Metrics (`src/tcp_agent/evaluation.py`)
+
+| Symbol | Meaning |
+|--------|--------|
+| **APFD** | Average Percentage of Faults Detected — earlier failures in the ordered list score higher (~0.5 random). |
+| **APFDc** | Cost-cognizant variant using **`Duration`** (see implementation). |
+| **P@10** here | `(# failing tests in the first 10 positions) / 10` — **not** recall; with very few failures, the value is capped (e.g. one failure → max `0.1`). |
+
+Merging LLM output with the target build uses **`build_ranked_df`** (`ranker.py`): **outer** merge so missing tests keep worst priority instead of disappearing.
+
+---
+
+## Ranking internals (summary)
+
+- High-risk tests are processed in batches of **`_RANKING_BATCH_SIZE`** (15). Up to **`_RANKING_PARALLELISM`** batches (4) may run in **threads**—increase only if your API tier supports the extra TPM/RPM.
+- **Models** are created with LangChain **`init_chat_model`**; names starting with `claude` use Anthropic, names containing `gemini` use Google, otherwise OpenAI.
+
+---
+
+## Repository layout
 
 ```
-src/tcp_agent/
-  agent/
-    tcp_agent.py              # LangGraph agent + system prompt + structured output
-    ranker.py                 # merges ranking with actual Verdict/Duration (outer merge)
-  tools/
-    history_tool.py           # get_all_failure_rates, get_test_risk_profile
-    complexity_tool.py        # get_test_complexity (37 raw TES_COM + TES_PRO features)
-    covered_code_risk_tool.py # get_covered_code_risk (81 raw COD_COV features)
-  evaluation.py               # APFD, APFDc, Precision@k
-  data_loader.py              # CSV loader (ML baseline)
-  features.py                 # SMOTE + feature cleaning (ML baseline)
-  model.py                    # Random Forest classifier (ML baseline)
-  ranking.py                  # probability-based ranking (ML baseline)
-
-scripts/
-  run_llm_agent.py            # runs the LLM agent (single or batch)
-  run_agent.py                # runs the ML baseline
-
-datasets/                     # 25 CSVs from TCP-CI benchmark
+tcp-test-prioritization-agent/
+├── scripts/
+│   ├── run_llm_agent.py      # Evaluation + batch runs + CLI
+│   └── run_agent.py          # RF baseline (local, --data required)
+├── datasets/                 # TCP-CI-style CSVs (25 subjects in this project)
+├── results/                  # Default output for --results-csv
+├── requirements.txt
+├── .env                      # API keys (not committed)
+└── src/tcp_agent/
+    ├── agent/
+    │   ├── tcp_agent.py      # run_agent → Filter → Ranking → validate / fallback
+    │   ├── filter_agent.py   # T1–T6 classification
+    │   ├── ranking_agent.py  # LangGraph ranking for T1–T5
+    │   ├── validator.py      # Checks + deterministic_fallback
+    │   └── ranker.py         # normalize_ranked_items, build_ranked_df
+    ├── tools/
+    │   ├── feature_extractor.py   # CSV features for Filter (no LLM tools)
+    │   ├── history_tool.py        # get_test_risk_profile (Ranking)
+    │   ├── complexity_tool.py     # get_test_complexity
+    │   └── covered_code_risk_tool.py
+    ├── data_cache.py         # Thread-safe in-memory CSV parse cache
+    ├── data_loader.py        # RF baseline loading
+    ├── evaluation.py         # APFD, APFDc, precision_at_k
+    ├── config.py             # AgentMode PILOT / PRODUCTION
+    └── features.py, model.py, ranking.py   # RF baseline pipeline
 ```
 
----
-
-## Architecture Decisions
-
-| Decision | Rationale |
-|----------|-----------|
-| **REC-heavy tier system** | Yaraghi Table 12: REC_Age (#1), OwnersExperience (#2), AllCommitersExperience (#3). REC_M alone has CL=0.51 vs Full_M. |
-| **Coverage as tiebreaker only** | COV_M has CL=0.79 vs Full_M -- loses ~79% of comparisons (Yaraghi Table 10). |
-| **Structured output (Pydantic)** | Eliminates JSON parsing failures. Agent reasons freely, then output is extracted into a schema. |
-| **Outer merge in ranker** | Tests the LLM misses get worst rank instead of silently vanishing -- prevents inflated APFDc. |
-| **All raw features returned** | Tools return full feature vectors (37 for complexity, 81 for covered code risk) -- no summarization. |
-| **Optimal ordering within tiers** | Yaraghi Section 2.1: failed first, then by execution time ascending. Applied as within-tier tiebreaker. |
+Tier **definitions** for the Filter live in **`FILTER_SYSTEM_PROMPT`** inside `filter_agent.py`; ranking rules and tool instructions live in **`RANKING_SYSTEM_PROMPT`** in `ranking_agent.py`.
 
 ---
 
-## Differences from the Papers
+## Practical notes
 
-| Aspect | Papers | Our Agent |
-|--------|--------|-----------|
-| **Model** | Random Forest pairwise ranking | LLM (Claude Haiku 4.5) with heuristic tiers |
-| **Training** | Trained per-build, walk-forward | Zero training -- prompt-based reasoning |
-| **Feature access** | All 150+ features as numeric vectors | Same features via tool calls (full raw values) |
-| **Evaluation** | Last 50 failed builds, mean APFDc +/- stddev | Per-build splitting (single target build) |
-| **Class balancing** | SMOTE / Random Over-sampling | Not applicable (no training) |
-| **FF test handling** | Three-sigma outlier removal | Ranked in T1 (always-failing) |
+- **Rate limits:** Use **`--gap`** (and keep **`--workers 1`**) when you see `[filter-RETRY]` / `[ranking-RETRY]` or HTTP 429s. Ranking parallelism multiplies concurrent LLM traffic.
+- **Variance:** LLM outputs can vary run-to-run even at `temperature=0`.
+- **Data source:** CSVs follow the TCP-CI feature schema described in Yaraghi et al.; column presence can vary slightly by subject—tools and extractor guard missing columns where needed.
 
 ---
 
-## Notes
+## References
 
-- **Determinism**: Claude isn't fully deterministic even at `temperature=0`, so APFDc can vary slightly between runs.
-- **Rate limits**: The `--gap` flag spaces batch requests (default 65s). The agent retries automatically on 429 errors (up to 5 retries with 65s waits).
-- **Datasets**: From the [TCP-CI](https://github.com/icse2020/tcp-ci) benchmark (RTP-Torrent). Each CSV has pre-extracted features.
+- A. S. Yaraghi *et al.*, “Scalable and Accurate Test Case Prioritization in Continuous Integration Contexts,” *IEEE TSE*, 2022. (arXiv:2109.13168.)
+- J. Mendoza *et al.*, “On the Effectiveness of Data Balancing Techniques in the Context of ML-Based Test Case Prioritization,” PROMISE ’22. (ACM: 3558489.3559073.)
