@@ -93,27 +93,54 @@ Your ONLY job is to classify each test as "high-risk" (Tier 1-5) or
 sorted by execution time and appended last. Misclassifying a real failure
 as T6 is the costliest mistake you can make.
 
-## What the research says (Yaraghi et al. 2022, TCP-CI, IEEE TSE)
+## Class imbalance — be aggressive
 
-The Random Forest TCP model trained on the full feature set achieves the
-best APFDc. Its top-15 most predictive features (Table 12) are dominated
-by THREE feature groups:
-  • REC      — execution history    (REC_Age is feature #1 paper-wide)
-  • TES_PRO  — test ownership        (OwnersExperience is #2,
-                                      AllCommitersExperience is #3)
-  • TES_COM  — test source code      (size, complexity, comment ratio)
-Coverage features (COV / DET_COV / COD_COV) are the WEAKEST group.
-On some subjects (e.g. thinkaurelius/titan) TES_M (TES_PRO + TES_COM +
-TES_CHN) is the single best feature group, beating REC_M. So you MUST
-treat TES_PRO and TES_COM signals as first-class evidence.
+Per Mendoza et al. 2022, only ~3% of regression test executions fail.
+The training distribution is heavily biased toward passes. To compensate,
+err on the side of classifying borderline tests as T1-T5 rather than T6.
+False positives are cheap (the Ranking Agent re-sorts them); false
+negatives bury real failures and tank APFDc.
 
-The best single-feature heuristic the paper found is REC_TotalFailRate
-(descending). Tests that failed in the past tend to fail again; this
-remains the strongest individual signal.
+## You receive the FULL Yaraghi 2022 feature set per test
 
-REC_Age key insight (Figure 5 of the paper): failures drop sharply after
-the first 10–20% of a test's lifetime. Newly added tests are MUCH more
-likely to fail than mature tests. Treat low REC_Age as a real risk signal.
+Each test has up to 148 features across nine groups. Use them all when
+they're present, but weight them by their empirical predictive power.
+
+### Feature importance hierarchy (Yaraghi 2022 Table 12, RQ2.4)
+
+The published top-15 features by usage frequency in the trained Random
+Forest TCP model are dominated by three groups:
+
+  Tier-A (most predictive — these dominate the RF model's splits):
+    • REC_Age                       (#1, freq 17034 — sharp failure drop
+                                     after the first 10-20% of a test's
+                                     lifetime; low REC_Age = real risk)
+    • TES_PRO_OwnersExperience      (#2, freq 10618)
+    • TES_PRO_AllCommitersExperience (#3, freq 7643)
+    • REC_TotalMaxExeTime, REC_LastExeTime, REC_RecentMaxExeTime
+    • TES_PRO_OwnersContribution, TES_PRO_CommitCount
+    • REC_TotalAvgExeTime, REC_RecentAvgExeTime
+    • TES_COM_RatioCommentToCode, TES_COM_CountStmtDecl,
+      TES_COM_CountLineCodeDecl, TES_COM_CountLineBlank,
+      TES_COM_CountStmtExe
+
+  Tier-B (still informative but lower weight):
+    • Other REC_* (fail/transition rates, assert/exc rates, last verdict)
+    • Other TES_COM_* (cyclomatic, nesting, class/method counts)
+    • TES_CHN_* (test source churn metrics for THIS build)
+    • Other TES_PRO_* (DistinctDevCount, MinorContributorCount)
+
+  Tier-C (weakest group — coverage; CL=0.79 vs Full_M, Yaraghi RQ2.3):
+    • COV_*           (file coverage of changed/impacted code)
+    • COD_COV_*       (complexity/process/churn of covered prod code,
+                       split into _C_ for changed and _IMP_ for impacted)
+
+When two tests are otherwise tied, prefer evidence from Tier-A over
+Tier-B over Tier-C. Do not let the volume of COD_COV_* features (81 of
+them) drown out a single strong REC_ or TES_PRO signal.
+
+The strongest single-feature heuristic is REC_TotalFailRate descending.
+Tests that failed in the past tend to fail again.
 
 ## Tier criteria — ordered, take the HIGHEST that applies
 
@@ -125,13 +152,16 @@ T2 — Recent / active failure
        REC_RecentFailRate > 0
        OR REC_LastVerdict != 0
        OR REC_LastFailureAge in {0, 1, 2}
-       (don't require BOTH RecentFailRate>0 AND LastVerdict=1 — either is
-       sufficient. A test that flipped pass→fail→pass in recent builds
-       still belongs here.)
+       (don't require both — either is sufficient. A test that flipped
+       pass→fail→pass in recent builds still belongs here.)
 
-T3 — Fault-adjacent
-       DET_COV_C_Faults > 0  OR  DET_COV_IMP_Faults > 0
-       (covers code that has a history of bugs — buggy code stays buggy)
+T3 — Risky covered code (coverage signals — weakest group, but still
+     a real signal when other evidence is absent)
+       COV_ChnScoreSum > 0  OR  COV_ImpScoreSum > 0
+       OR high COD_COV_COM_C_SumCyclomatic / COD_COV_CHN_C_LinesAdded
+       OR high COD_COV_PRO_C_DistinctDevCount
+       (test covers production code that is changed, complex, churning,
+       or owned by many developers)
 
 T4 — Historical failure or instability
        REC_TotalFailRate > 0
@@ -145,11 +175,8 @@ T5 — Predictive non-history signals (no past failure, but the model
      would still flag it). Promote to T5 if ANY of these hold:
        • TES_CHN_LinesAdded > 0  OR  TES_CHN_LinesDeleted > 0
          (the test source itself was edited recently)
-       • COV_ChnScoreSum > 0  OR  COV_ImpScoreSum > 0
-         (test covers files that changed in this build)
        • REC_Age <= 5
-         (newly created test; failure prob. is highest in the first 10–20%
-         of a test's life — paper Fig. 5)
+         (newly created test; failure prob. peaks in first 10-20% of life)
        • TES_PRO_OwnersExperience low (<= 0.5)
          (test owned by a relatively new contributor)
        • TES_PRO_CommitCount >= 3
@@ -157,28 +184,30 @@ T5 — Predictive non-history signals (no past failure, but the model
        • TES_PRO_MinorContributorCount >= 2
          (multiple unfamiliar contributors → higher fault risk)
        • TES_COM_SumCyclomatic >= 20  OR  TES_COM_CountStmtExe >= 50
+         OR TES_COM_MaxNesting >= 4  OR  TES_COM_CountLineCode >= 200
          (large / complex test → exercises more code, more fault paths)
        • REC_TotalMaxExeTime > 60s  OR  REC_LastExeTime > 60s
          (long-running tests cover more code; treat as high-signal)
 
 T6 — Low-signal remainder
-     ONLY if every check above is false. To land in T6 a test should look
-     like: stable history, no recent edits, no coverage of changed code,
-     mature age, experienced owner, low complexity, short execution.
-     When unsure between T5 and T6, choose T5 — false positives are
-     cheap (the Ranking Agent re-sorts them) but false negatives are
-     expensive (a real failure gets buried).
+     ONLY if every check above is false. To land in T6 a test should
+     look like: stable history, no recent edits, no coverage of changed
+     code, mature age, experienced owner, low complexity, short execution.
+     When unsure between T5 and T6, choose T5 (see "class imbalance"
+     above — false negatives are costly).
 
 ## Rules
 
 - Pick the SINGLE highest tier that applies (T1 > T2 > T3 > T4 > T5 > T6).
-- A missing feature (absent key) = "no data" — do NOT treat it as zero.
+- A missing feature key = "no data" — do NOT treat it as zero.
   Real zeros (e.g. REC_LastVerdict=0) ARE present and ARE meaningful.
 - A value of -1 means "no data" / "never observed" — IGNORE it; do NOT
   use it as evidence in either direction.
-- Numeric thresholds above are guidelines, not hard cutoffs. Use them to
-  build intuition; if a test is borderline-but-trending-risky, choose
-  the higher tier.
+- Numeric thresholds are guidelines, not hard cutoffs. If a test is
+  borderline-but-trending-risky, choose the higher tier.
+- DET_COV_C_Faults and DET_COV_IMP_Faults are NOT in your feature set
+  (they are excluded as label leakage — they count faults DETECTED in
+  the build being evaluated, which is post-hoc information).
 - Output: test_id (int), tier (int 1-6), and 1 (max 2) key_signals.
 - key_signals MUST be short "feature=value" strings, ≤30 chars each.
   Example: ["REC_TotalFailRate=0.92"], ["REC_Age=2"], ["TES_CHN_LinesAdded=14"].
@@ -279,7 +308,7 @@ def _classify_batch(
 
 def run_filter_agent(
     dataset_path: str,
-    batch_size: int = 100,
+    batch_size: int = 40,
     filter_model: str = "gpt-4o-mini",
 ) -> FilterResult:
     """Run the Filter Agent over the dataset.

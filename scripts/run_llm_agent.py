@@ -33,7 +33,7 @@ import pandas as pd
 
 # default settings — can be overridden via CLI
 _mode = AgentMode.PILOT
-_batch_size = 100
+_batch_size = 40
 _filter_model = "gpt-4o-mini"
 _ranking_model = "gpt-4o"
 
@@ -122,9 +122,10 @@ def main():
         help="Agent mode: 'pilot' reads from CSV (default), 'production' extracts from real sources",
     )
     parser.add_argument(
-        "--batch-size", type=int, default=100,
-        help="Number of tests per Filter Agent batch (default: 100). "
-             "Auto-splits on output-token-limit errors; lower if you see frequent splits.",
+        "--batch-size", type=int, default=40,
+        help="Number of tests per Filter Agent batch (default: 40, sized for "
+             "the full 148-feature Yaraghi 2022 set). Auto-splits on output-"
+             "token-limit errors; lower if you see frequent splits.",
     )
     parser.add_argument(
         "--filter-model", type=str, default="gpt-4o-mini",
