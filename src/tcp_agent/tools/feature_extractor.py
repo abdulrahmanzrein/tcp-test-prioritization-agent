@@ -21,30 +21,40 @@ from tcp_agent.data_cache import load_dataset
 
 _RISK_PROFILE_COLS = [
     "Test",
-    # failure / verdict history
+    # ── REC: execution history (paper Table 12 — top features) ───────
     "REC_RecentFailRate", "REC_TotalFailRate",
     "REC_LastVerdict", "REC_LastFailureAge",
     "REC_RecentTransitionRate", "REC_TotalTransitionRate",
-    "REC_Age",
+    "REC_Age",                       # #1 most predictive feature paper-wide
     "REC_RecentAssertRate", "REC_TotalAssertRate",
     "REC_RecentExcRate", "REC_TotalExcRate",
-    # execution time history
     "REC_LastExeTime",
     "REC_RecentAvgExeTime", "REC_RecentMaxExeTime",
     "REC_TotalAvgExeTime", "REC_TotalMaxExeTime",
-    # transition age
     "REC_LastTransitionAge",
-    # file-level failure rate
     "REC_MaxTestFileFailRate", "REC_MaxTestFileTransitionRate",
-    # fault detection coverage
+    # ── DET_COV: fault history of covered files ──────────────────────
     "DET_COV_C_Faults", "DET_COV_IMP_Faults",
-    # change/impact coverage scores
+    # ── COV: change/impact coverage scores ───────────────────────────
     "COV_ChnScoreSum", "COV_ImpScoreSum",
     "COV_ChnCount", "COV_ImpCount",
-    # test file churn
+    # ── TES_CHN: test file churn (this build) ────────────────────────
     "TES_CHN_LinesAdded", "TES_CHN_LinesDeleted",
     "TES_CHN_AddedChangeScattering", "TES_CHN_DeletedChangeScattering",
     "TES_CHN_DMMSize", "TES_CHN_DMMComplexity", "TES_CHN_DMMInterfacing",
+    # ── TES_PRO: test ownership / process metrics ─────────────────────
+    # Per Yaraghi 2022 Table 12, OwnersExperience (#2), AllCommitersExperience
+    # (#3), OwnersContribution, and CommitCount are all among the top-7 most
+    # predictive features. On some subjects (e.g. thinkaurelius/titan) the
+    # TES_M model (TES_PRO + TES_COM + TES_CHN) is the single best feature
+    # group, beating REC_M. The Filter MUST see them.
+    "TES_PRO_OwnersExperience", "TES_PRO_AllCommitersExperience",
+    "TES_PRO_OwnersContribution", "TES_PRO_CommitCount",
+    "TES_PRO_DistinctDevCount", "TES_PRO_MinorContributorCount",
+    # ── TES_COM: test source-code complexity / size ──────────────────
+    "TES_COM_SumCyclomatic", "TES_COM_CountLineCode",
+    "TES_COM_CountStmtDecl", "TES_COM_CountStmtExe",
+    "TES_COM_RatioCommentToCode",
 ]
 
 

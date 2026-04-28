@@ -16,7 +16,6 @@ Design
 """
 
 import json
-import math
 import time
 import warnings
 
@@ -31,6 +30,25 @@ from tcp_agent.tools.feature_extractor import (
     extract_failure_rates,
     extract_exec_times,
 )
+
+
+def _invoke_with_retry(model, messages, max_retries: int = 6):
+    """Minimal retry: exponential backoff on transient errors, re-raise length/auth."""
+    for attempt in range(max_retries):
+        try:
+            return model.invoke(messages)
+        except Exception as e:
+            name = type(e).__name__
+            msg = str(e).lower()
+            if name == "LengthFinishReasonError" or "length limit" in msg:
+                raise
+            if "401" in str(e) or "403" in str(e) or "invalid_api_key" in msg:
+                raise
+            if attempt == max_retries - 1:
+                raise
+            wait = 65 if "rate" in msg or "429" in str(e) else min(2 ** attempt, 30)
+            print(f"  [filter-RETRY] {attempt + 1}/{max_retries} {name}: {str(e)[:120]}", flush=True)
+            time.sleep(wait)
 
 
 # ── Structured output schemas ────────────────────────────────────────
@@ -69,25 +87,102 @@ class FilterResult:
 # ── System prompt ────────────────────────────────────────────────────
 
 FILTER_SYSTEM_PROMPT = """\
-You are a test-case triage agent.  Your ONLY job is to classify each test as
-"high-risk" (Tier 1-5) or "low-signal" (Tier 6).
+You are a test-case triage agent for a Continuous Integration system.
+Your ONLY job is to classify each test as "high-risk" (Tier 1-5) or
+"low-signal" (Tier 6). The Ranking Agent will deeply rank T1-T5; T6 is
+sorted by execution time and appended last. Misclassifying a real failure
+as T6 is the costliest mistake you can make.
 
-## Tier Criteria  (from TCP-CI research, Yaraghi et al. 2022)
+## What the research says (Yaraghi et al. 2022, TCP-CI, IEEE TSE)
 
-T1 — Persistent failure:   REC_TotalFailRate >= 0.9
-T2 — Recent/active failure: REC_RecentFailRate > 0  AND  REC_LastVerdict = 1
-T3 — Fault-adjacent:        DET_COV_C_Faults > 0  OR  DET_COV_IMP_Faults > 0
-T4 — Historical failure:    failure_rate > 0  but  REC_RecentFailRate = 0
-T5 — High-signal, never failed:
-     COV_ChnScoreSum > 0  OR  high TES_COM_SumCyclomatic  OR
-     low TES_PRO_OwnersExperience  OR  high COD_COV_COM_C_SumCyclomatic
-T6 — Low-signal remainder:  none of the above
+The Random Forest TCP model trained on the full feature set achieves the
+best APFDc. Its top-15 most predictive features (Table 12) are dominated
+by THREE feature groups:
+  • REC      — execution history    (REC_Age is feature #1 paper-wide)
+  • TES_PRO  — test ownership        (OwnersExperience is #2,
+                                      AllCommitersExperience is #3)
+  • TES_COM  — test source code      (size, complexity, comment ratio)
+Coverage features (COV / DET_COV / COD_COV) are the WEAKEST group.
+On some subjects (e.g. thinkaurelius/titan) TES_M (TES_PRO + TES_COM +
+TES_CHN) is the single best feature group, beating REC_M. So you MUST
+treat TES_PRO and TES_COM signals as first-class evidence.
+
+The best single-feature heuristic the paper found is REC_TotalFailRate
+(descending). Tests that failed in the past tend to fail again; this
+remains the strongest individual signal.
+
+REC_Age key insight (Figure 5 of the paper): failures drop sharply after
+the first 10–20% of a test's lifetime. Newly added tests are MUCH more
+likely to fail than mature tests. Treat low REC_Age as a real risk signal.
+
+## Tier criteria — ordered, take the HIGHEST that applies
+
+T1 — Persistent failure
+       REC_TotalFailRate >= 0.5
+       (test has been broken in a large fraction of its history)
+
+T2 — Recent / active failure
+       REC_RecentFailRate > 0
+       OR REC_LastVerdict != 0
+       OR REC_LastFailureAge in {0, 1, 2}
+       (don't require BOTH RecentFailRate>0 AND LastVerdict=1 — either is
+       sufficient. A test that flipped pass→fail→pass in recent builds
+       still belongs here.)
+
+T3 — Fault-adjacent
+       DET_COV_C_Faults > 0  OR  DET_COV_IMP_Faults > 0
+       (covers code that has a history of bugs — buggy code stays buggy)
+
+T4 — Historical failure or instability
+       REC_TotalFailRate > 0
+       OR REC_TotalAssertRate > 0
+       OR REC_TotalExcRate > 0
+       OR REC_TotalTransitionRate > 0
+       OR REC_RecentTransitionRate > 0
+       (any past failure or verdict transition — even one — is a signal)
+
+T5 — Predictive non-history signals (no past failure, but the model
+     would still flag it). Promote to T5 if ANY of these hold:
+       • TES_CHN_LinesAdded > 0  OR  TES_CHN_LinesDeleted > 0
+         (the test source itself was edited recently)
+       • COV_ChnScoreSum > 0  OR  COV_ImpScoreSum > 0
+         (test covers files that changed in this build)
+       • REC_Age <= 5
+         (newly created test; failure prob. is highest in the first 10–20%
+         of a test's life — paper Fig. 5)
+       • TES_PRO_OwnersExperience low (<= 0.5)
+         (test owned by a relatively new contributor)
+       • TES_PRO_CommitCount >= 3
+         (test under active development — many recent edits)
+       • TES_PRO_MinorContributorCount >= 2
+         (multiple unfamiliar contributors → higher fault risk)
+       • TES_COM_SumCyclomatic >= 20  OR  TES_COM_CountStmtExe >= 50
+         (large / complex test → exercises more code, more fault paths)
+       • REC_TotalMaxExeTime > 60s  OR  REC_LastExeTime > 60s
+         (long-running tests cover more code; treat as high-signal)
+
+T6 — Low-signal remainder
+     ONLY if every check above is false. To land in T6 a test should look
+     like: stable history, no recent edits, no coverage of changed code,
+     mature age, experienced owner, low complexity, short execution.
+     When unsure between T5 and T6, choose T5 — false positives are
+     cheap (the Ranking Agent re-sorts them) but false negatives are
+     expensive (a real failure gets buried).
 
 ## Rules
-- If a test meets ANY of T1-T5, classify it at its HIGHEST tier (T1 > T2 > …).
-- A missing feature (absent key) means "no data" — do NOT treat it as zero.
-- For each test output: test_id, tier (int 1-6), and 1-2 key_signals
-  (feature=value strings that justify the tier).
+
+- Pick the SINGLE highest tier that applies (T1 > T2 > T3 > T4 > T5 > T6).
+- A missing feature (absent key) = "no data" — do NOT treat it as zero.
+  Real zeros (e.g. REC_LastVerdict=0) ARE present and ARE meaningful.
+- A value of -1 means "no data" / "never observed" — IGNORE it; do NOT
+  use it as evidence in either direction.
+- Numeric thresholds above are guidelines, not hard cutoffs. Use them to
+  build intuition; if a test is borderline-but-trending-risky, choose
+  the higher tier.
+- Output: test_id (int), tier (int 1-6), and 1 (max 2) key_signals.
+- key_signals MUST be short "feature=value" strings, ≤30 chars each.
+  Example: ["REC_TotalFailRate=0.92"], ["REC_Age=2"], ["TES_CHN_LinesAdded=14"].
+  No prose, no explanations.
 - You MUST classify EVERY test in the batch — do not skip any.
 """
 
@@ -103,19 +198,11 @@ def _resolve_provider(model_name: str) -> str | None:
     return None
 
 
-def _invoke_with_retry(model, messages, max_retries=5):
-    for attempt in range(max_retries):
-        try:
-            return model.invoke(messages)
-        except Exception as e:
-            err = str(e).lower()
-            if "429" in str(e) or "rate_limit" in err or "overloaded" in err:
-                time.sleep(65)
-            elif "connection" in err or "ssl" in err or "read" in err or "timeout" in err:
-                time.sleep(10)
-            else:
-                raise
-    raise Exception(f"Still rate-limited after {max_retries} retries")
+def _build_structured_model(model_name: str):
+    """Initialize a chat model and bind the BatchClassificationResult schema."""
+    provider = _resolve_provider(model_name)
+    base = init_chat_model(model_name, model_provider=provider, temperature=0)
+    return base.with_structured_output(BatchClassificationResult)
 
 
 # ── Core filter logic ────────────────────────────────────────────────
@@ -148,28 +235,58 @@ def _chunk(lst: list, size: int) -> list[list]:
     return [lst[i : i + size] for i in range(0, len(lst), size)]
 
 
+def _is_length_error(e: Exception) -> bool:
+    """Detect OpenAI's LengthFinishReasonError without importing the class
+    (it's only raised through structured-output calls). Fallback to string match."""
+    name = type(e).__name__
+    if name == "LengthFinishReasonError":
+        return True
+    msg = str(e).lower()
+    return "length limit was reached" in msg or "length_finish_reason" in msg
+
+
+def _classify_batch(
+    structured_model,
+    batch: list[dict],
+    failure_rates: dict,
+    exec_times: dict,
+    min_chunk: int = 8,
+):
+    """Classify a single batch. Auto-splits on output-length errors."""
+    prompt = _build_batch_prompt(batch, failure_rates, exec_times)
+    try:
+        return _invoke_with_retry(
+            structured_model,
+            [
+                SystemMessage(content=FILTER_SYSTEM_PROMPT),
+                HumanMessage(content=prompt),
+            ],
+        )
+    except Exception as e:
+        if not _is_length_error(e) or len(batch) <= min_chunk:
+            raise
+        mid = len(batch) // 2
+        print(
+            f"   ⚠️  Filter batch hit output-length limit "
+            f"({len(batch)} tests) — splitting into {mid} + {len(batch) - mid}"
+        )
+        left = _classify_batch(structured_model, batch[:mid], failure_rates, exec_times, min_chunk)
+        right = _classify_batch(structured_model, batch[mid:], failure_rates, exec_times, min_chunk)
+        return BatchClassificationResult(
+            classifications=list(left.classifications) + list(right.classifications)
+        )
+
+
 def run_filter_agent(
     dataset_path: str,
-    batch_size: int = 200,
+    batch_size: int = 100,
     filter_model: str = "gpt-4o-mini",
 ) -> FilterResult:
     """Run the Filter Agent over the dataset.
 
-    Parameters
-    ----------
-    dataset_path : str
-        Path to the CSV dataset.
-    batch_size : int
-        Number of tests per LLM batch call (default 200).
-    filter_model : str
-        LLM model name for the filter agent (default gpt-4o-mini).
-
-    Returns
-    -------
-    FilterResult
-        Container with high_risk_tests, low_signal_tests, and metadata.
+    Returns a FilterResult containing high_risk_tests (T1-T5),
+    low_signal_tests (T6), and metadata.
     """
-    # ── 1. Pre-extract all features (pure Python, no LLM) ────────────
     risk_profiles = extract_risk_profiles(dataset_path, sparse=True)
     failure_rates = extract_failure_rates(dataset_path)
     exec_times = extract_exec_times(dataset_path)
@@ -177,21 +294,11 @@ def run_filter_agent(
     total_tests = len(risk_profiles)
     batches = _chunk(risk_profiles, batch_size)
 
-    # ── 2. Init LLM with structured output ───────────────────────────
-    provider = _resolve_provider(filter_model)
-    model = init_chat_model(filter_model, model_provider=provider, temperature=0)
-    structured_model = model.with_structured_output(BatchClassificationResult)
-
-    # ── 3. Process each batch ────────────────────────────────────────
+    structured_model = _build_structured_model(filter_model)
     result = FilterResult()
 
     for batch_idx, batch in enumerate(batches):
-        prompt = _build_batch_prompt(batch, failure_rates, exec_times)
-
-        parsed = _invoke_with_retry(structured_model, [
-            SystemMessage(content=FILTER_SYSTEM_PROMPT),
-            HumanMessage(content=prompt),
-        ])
+        parsed = _classify_batch(structured_model, batch, failure_rates, exec_times)
 
         # merge classifications into result
         batch_test_ids = {p["test"] for p in batch}
@@ -220,7 +327,6 @@ def run_filter_agent(
                 "avg_exec_time": exec_times.get(tid, 0.0),
             })
 
-    # ── 4. Metadata ──────────────────────────────────────────────────
     result.metadata = {
         "total_tests": total_tests,
         "num_batches": len(batches),
