@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import csv
 import os
@@ -31,8 +33,7 @@ import pandas as pd
 
 # default settings — can be overridden via CLI
 _mode = AgentMode.PILOT
-_strategy = "multi"
-_batch_size = 200
+_batch_size = 100
 _filter_model = "gpt-4o-mini"
 _ranking_model = "gpt-4o"
 
@@ -78,7 +79,6 @@ def evaluate(csv_path, verbose=False, eval_window=5, gap=65.0):
         ranked = run_agent(
             tmp_path,
             mode=_mode,
-            strategy=_strategy,
             batch_size=_batch_size,
             filter_model=_filter_model,
             ranking_model=_ranking_model,
@@ -109,7 +109,7 @@ def evaluate(csv_path, verbose=False, eval_window=5, gap=65.0):
 
 
 def main():
-    global _mode, _strategy, _batch_size, _filter_model, _ranking_model
+    global _mode, _batch_size, _filter_model, _ranking_model
 
     parser = argparse.ArgumentParser()
     g = parser.add_mutually_exclusive_group(required=True)
@@ -122,22 +122,17 @@ def main():
         help="Agent mode: 'pilot' reads from CSV (default), 'production' extracts from real sources",
     )
     parser.add_argument(
-        "--strategy",
-        choices=["single", "multi"],
-        default="multi",
-        help="Agent strategy: 'single' = legacy one-agent loop, 'multi' = two-agent pipeline (default)",
-    )
-    parser.add_argument(
-        "--batch-size", type=int, default=200,
-        help="Number of tests per Filter Agent batch (multi strategy only, default: 200)",
+        "--batch-size", type=int, default=100,
+        help="Number of tests per Filter Agent batch (default: 100). "
+             "Auto-splits on output-token-limit errors; lower if you see frequent splits.",
     )
     parser.add_argument(
         "--filter-model", type=str, default="gpt-4o-mini",
-        help="LLM model for the Filter Agent (multi strategy only, default: gpt-4o-mini)",
+        help="LLM model for the Filter Agent (default: gpt-4o-mini)",
     )
     parser.add_argument(
         "--ranking-model", type=str, default="gpt-4o",
-        help="LLM model for the Ranking Agent (multi strategy only, default: gpt-4o)",
+        help="LLM model for the Ranking Agent (default: gpt-4o)",
     )
     parser.add_argument(
         "--eval-window", type=int, default=5,
@@ -161,13 +156,12 @@ def main():
     )
     args = parser.parse_args()
     _mode = AgentMode.PILOT if args.mode == "pilot" else AgentMode.PRODUCTION
-    _strategy = args.strategy
     _batch_size = args.batch_size
     _filter_model = args.filter_model
     _ranking_model = args.ranking_model
 
     needed_keys = set()
-    for model_name in (_filter_model, _ranking_model):
+    for model_name in [_filter_model, _ranking_model]:
         name = model_name.lower()
         if "gemini" in name:
             needed_keys.add("GOOGLE_API_KEY")

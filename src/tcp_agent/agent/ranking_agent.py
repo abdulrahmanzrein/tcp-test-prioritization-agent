@@ -15,8 +15,8 @@ Design
 3. Appends T6 tail sorted by execution cost ascending.
 """
 
-import time
 import operator
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from langchain.chat_models import init_chat_model
@@ -29,6 +29,25 @@ from tcp_agent.agent.filter_agent import FilterResult
 from tcp_agent.tools.history_tool import get_test_risk_profile
 from tcp_agent.tools.complexity_tool import get_test_complexity
 from tcp_agent.tools.covered_code_risk_tool import get_covered_code_risk
+
+
+def _invoke_with_retry(model, messages, max_retries: int = 6):
+    """Minimal retry: exponential backoff on transient errors, re-raise length/auth."""
+    for attempt in range(max_retries):
+        try:
+            return model.invoke(messages)
+        except Exception as e:
+            name = type(e).__name__
+            msg = str(e).lower()
+            if name == "LengthFinishReasonError" or "length limit" in msg:
+                raise
+            if "401" in str(e) or "403" in str(e) or "invalid_api_key" in msg:
+                raise
+            if attempt == max_retries - 1:
+                raise
+            wait = 65 if "rate" in msg or "429" in str(e) else min(2 ** attempt, 30)
+            print(f"  [ranking-RETRY] {attempt + 1}/{max_retries} {name}: {str(e)[:120]}", flush=True)
+            time.sleep(wait)
 
 
 # ── Structured output schema ─────────────────────────────────────────
@@ -119,22 +138,11 @@ def _resolve_provider(model_name: str) -> str | None:
     return None
 
 
-def _invoke_with_retry(model, messages, max_retries=5):
-    last_error = None
-    for attempt in range(max_retries):
-        try:
-            return model.invoke(messages)
-        except Exception as e:
-            last_error = e
-            err = str(e).lower()
-            print(f"  [RETRY] Attempt {attempt+1}/{max_retries} failed: {type(e).__name__}: {e}")
-            if "429" in str(e) or "rate_limit" in err or "overloaded" in err:
-                time.sleep(65)
-            elif "connection" in err or "ssl" in err or "read" in err or "timeout" in err:
-                time.sleep(10)
-            else:
-                raise
-    raise Exception(f"Failed after {max_retries} retries. Last error: {last_error}")
+def _build_models(model_name: str, tools: list):
+    """Initialize a chat model and return (tools-bound, structured-output) pair."""
+    provider = _resolve_provider(model_name)
+    base = init_chat_model(model_name, model_provider=provider, temperature=0)
+    return base.bind_tools(tools), base.with_structured_output(PrioritizedTests)
 
 
 # ── Main ranking function ────────────────────────────────────────────
@@ -147,7 +155,7 @@ def _chunk_list(lst: list, size: int) -> list[list]:
 # Max tests per ranking batch — keeps tool output within GPT-4o's 128K context.
 # 3 tools × ~30 features × 30 tests ≈ 25K tokens, well within limits.
 # Going larger trades a bit of LLM ranking-precision risk for fewer round trips.
-_RANKING_BATCH_SIZE = 30
+_RANKING_BATCH_SIZE = 15
 
 # How many ranking batches to run concurrently across threads.  Each batch is
 # an independent LangGraph instance with its own model/tools, so it's safe to
@@ -167,12 +175,10 @@ def _rank_batch(
 ) -> list[dict]:
     """Rank a single batch of high-risk tests via the LLM tool-calling loop."""
 
-    provider = _resolve_provider(ranking_model)
-    model = init_chat_model(ranking_model, model_provider=provider, temperature=0)
-
     tools = [get_test_risk_profile, get_test_complexity, get_covered_code_risk]
     tools_by_name = {t.name: t for t in tools}
-    model_with_tools = model.bind_tools(tools)
+
+    model_with_tools, structured_model = _build_models(ranking_model, tools)
 
     # ── Build context message with filter results ────────────────────
     filter_summary_lines = [
@@ -236,14 +242,16 @@ def _rank_batch(
 
     # ── Extract structured output ────────────────────────────────────
     final_content = result["messages"][-1].content
-    structured_model = model.with_structured_output(PrioritizedTests)
-    parsed = _invoke_with_retry(structured_model, [
-        SystemMessage(
-            content="Extract the test prioritization from this message into the schema. "
-                    "Keep all reasons intact."
-        ),
-        HumanMessage(content=final_content),
-    ])
+    parsed = _invoke_with_retry(
+        structured_model,
+        [
+            SystemMessage(
+                content="Extract the test prioritization from this message into the schema. "
+                        "Keep all reasons intact."
+            ),
+            HumanMessage(content=final_content),
+        ],
+    )
 
     return [t.model_dump() for t in parsed.ranked_tests]
 
@@ -256,22 +264,9 @@ def run_ranking_agent(
     """Run the Ranking Agent on the filtered high-risk tests.
 
     Splits high-risk tests into batches to stay within model context limits.
-    Each batch is ranked independently, then results are merged by tier and
-    confidence to produce the final ordering.
-
-    Parameters
-    ----------
-    filter_result : FilterResult
-        Output from the Filter Agent.
-    dataset_path : str
-        Path to the CSV dataset (passed to tools).
-    ranking_model : str
-        LLM model name for the ranking agent (default gpt-4o).
-
-    Returns
-    -------
-    list[dict]
-        Full ranked list: high-risk tests with reasoning + T6 tail.
+    Each batch is ranked independently, then results are merged by batch
+    order to produce the final ordering. Returns the full ranked list:
+    high-risk tests with reasoning + T6 tail.
     """
     high_risk_tests = filter_result.high_risk_tests
     high_risk_ids = [t["test_id"] for t in high_risk_tests]
@@ -340,6 +335,30 @@ def run_ranking_agent(
     all_ranked.sort(key=_sort_key)
     for item in all_ranked:
         item.pop("_batch_idx", None)
+
+    # ── Recover any high-risk tests the LLM dropped ──────────────────
+    # gpt-4o-mini occasionally truncates JSON arrays — append missing tests
+    # before validation so the LLM's good rankings aren't discarded just
+    # because a few items got dropped from a long structured-output list.
+    returned_ids = {str(item["test"]) for item in all_ranked}
+    missing = [t for t in high_risk_tests if str(t["test_id"]) not in returned_ids]
+    if missing:
+        print(
+            f"  [RANKING] LLM dropped {len(missing)} high-risk test(s); "
+            f"appending with conservative fallback reason."
+        )
+        for t in missing:
+            all_ranked.append({
+                "test": str(t["test_id"]),
+                "priority": 0,  # re-numbered below
+                "confidence": 0.4,
+                "reason": (
+                    f"Tier {t.get('tier', 5)} (LLM-dropped recovery): The Filter Agent "
+                    f"flagged this as high-risk but the Ranking Agent omitted it from its "
+                    f"output. Appended at the end of the high-risk section. "
+                    f"Filter signals: {', '.join(t.get('key_signals', []))}."
+                ),
+            })
 
     # ── Re-number priorities sequentially ────────────────────────────
     for i, item in enumerate(all_ranked):

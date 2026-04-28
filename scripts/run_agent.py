@@ -1,4 +1,12 @@
 import argparse
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = PROJECT_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
 from tcp_agent.data_loader import load_data, get_features_and_labels, get_metadata
 from tcp_agent.features import clean_features
 from tcp_agent.model import train_model
