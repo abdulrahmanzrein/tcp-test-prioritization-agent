@@ -32,23 +32,7 @@ from tcp_agent.tools.feature_extractor import (
 )
 
 
-def _invoke_with_retry(model, messages, max_retries: int = 6):
-    """Minimal retry: exponential backoff on transient errors, re-raise length/auth."""
-    for attempt in range(max_retries):
-        try:
-            return model.invoke(messages)
-        except Exception as e:
-            name = type(e).__name__
-            msg = str(e).lower()
-            if name == "LengthFinishReasonError" or "length limit" in msg:
-                raise
-            if "401" in str(e) or "403" in str(e) or "invalid_api_key" in msg:
-                raise
-            if attempt == max_retries - 1:
-                raise
-            wait = 65 if "rate" in msg or "429" in str(e) else min(2 ** attempt, 30)
-            print(f"  [filter-RETRY] {attempt + 1}/{max_retries} {name}: {str(e)[:120]}", flush=True)
-            time.sleep(wait)
+from tcp_agent.utils.llm_utils import resolve_provider, invoke_with_retry
 
 
 # ── Structured output schemas ────────────────────────────────────────
@@ -218,19 +202,14 @@ T6 — Low-signal remainder
 
 # ── Helper: LLM call with retry ──────────────────────────────────────
 
-def _resolve_provider(model_name: str) -> str | None:
-    name = model_name.lower()
-    if "gemini" in name:
-        return "google_genai"
-    if name.startswith("claude"):
-        return "anthropic"
-    return None
-
+# ── Helper: LLM call with retry ──────────────────────────────────────
 
 def _build_structured_model(model_name: str):
     """Initialize a chat model and bind the BatchClassificationResult schema."""
-    provider = _resolve_provider(model_name)
-    base = init_chat_model(model_name, model_provider=provider, temperature=0)
+    provider = resolve_provider(model_name)
+    # o-series models (o1, o3) do not support temperature
+    kwargs = {"temperature": 0} if not (model_name.startswith("o1") or model_name.startswith("o3")) else {}
+    base = init_chat_model(model_name, model_provider=provider, **kwargs)
     return base.with_structured_output(BatchClassificationResult)
 
 
@@ -276,6 +255,7 @@ def _is_length_error(e: Exception) -> bool:
 
 def _classify_batch(
     structured_model,
+    model_name: str,
     batch: list[dict],
     failure_rates: dict,
     exec_times: dict,
@@ -284,12 +264,13 @@ def _classify_batch(
     """Classify a single batch. Auto-splits on output-length errors."""
     prompt = _build_batch_prompt(batch, failure_rates, exec_times)
     try:
-        return _invoke_with_retry(
+        return invoke_with_retry(
             structured_model,
             [
                 SystemMessage(content=FILTER_SYSTEM_PROMPT),
                 HumanMessage(content=prompt),
             ],
+            model_name=model_name
         )
     except Exception as e:
         if not _is_length_error(e) or len(batch) <= min_chunk:
@@ -299,8 +280,8 @@ def _classify_batch(
             f"   ⚠️  Filter batch hit output-length limit "
             f"({len(batch)} tests) — splitting into {mid} + {len(batch) - mid}"
         )
-        left = _classify_batch(structured_model, batch[:mid], failure_rates, exec_times, min_chunk)
-        right = _classify_batch(structured_model, batch[mid:], failure_rates, exec_times, min_chunk)
+        left = _classify_batch(structured_model, model_name, batch[:mid], failure_rates, exec_times, min_chunk)
+        right = _classify_batch(structured_model, model_name, batch[mid:], failure_rates, exec_times, min_chunk)
         return BatchClassificationResult(
             classifications=list(left.classifications) + list(right.classifications)
         )
@@ -327,7 +308,7 @@ def run_filter_agent(
     result = FilterResult()
 
     for batch_idx, batch in enumerate(batches):
-        parsed = _classify_batch(structured_model, batch, failure_rates, exec_times)
+        parsed = _classify_batch(structured_model, filter_model, batch, failure_rates, exec_times)
 
         # merge classifications into result
         batch_test_ids = {p["test"] for p in batch}

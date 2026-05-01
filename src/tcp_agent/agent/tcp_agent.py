@@ -33,6 +33,7 @@ def run_multi_agent(
     batch_size: int = 200,
     filter_model: str = "gpt-4o-mini",
     ranking_model: str = "gpt-4o",
+    no_validation: bool = False,
 ):
     """Two-agent pipeline: Filter → Ranking → Validation.
 
@@ -74,8 +75,12 @@ def run_multi_agent(
     validation = validate_ranking(ranked, expected_ids, filter_result)
     logger.info(str(validation))
 
-    if validation.is_valid:
+    if validation.is_valid or no_validation:
+        if not validation.is_valid:
+            logger.warning("Bypassing validation failure per --no-validation")
+            log_validation_errors(validation)
         return ranked
+
     log_validation_errors(validation)
     logger.warning("Falling back to deterministic ranker")
     return deterministic_fallback(dataset_path)
@@ -87,6 +92,7 @@ def run_agent(
     batch_size: int = 200,
     filter_model: str = "gpt-4o-mini",
     ranking_model: str = "gpt-4o",
+    no_validation: bool = False,
 ):
     """Run the TCP multi-agent pipeline."""
     return run_multi_agent(
@@ -95,4 +101,5 @@ def run_agent(
         batch_size=batch_size,
         filter_model=filter_model,
         ranking_model=ranking_model,
+        no_validation=no_validation,
     )

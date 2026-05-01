@@ -31,23 +31,7 @@ from tcp_agent.tools.complexity_tool import get_test_complexity
 from tcp_agent.tools.covered_code_risk_tool import get_covered_code_risk
 
 
-def _invoke_with_retry(model, messages, max_retries: int = 6):
-    """Minimal retry: exponential backoff on transient errors, re-raise length/auth."""
-    for attempt in range(max_retries):
-        try:
-            return model.invoke(messages)
-        except Exception as e:
-            name = type(e).__name__
-            msg = str(e).lower()
-            if name == "LengthFinishReasonError" or "length limit" in msg:
-                raise
-            if "401" in str(e) or "403" in str(e) or "invalid_api_key" in msg:
-                raise
-            if attempt == max_retries - 1:
-                raise
-            wait = 65 if "rate" in msg or "429" in str(e) else min(2 ** attempt, 30)
-            print(f"  [ranking-RETRY] {attempt + 1}/{max_retries} {name}: {str(e)[:120]}", flush=True)
-            time.sleep(wait)
+from tcp_agent.utils.llm_utils import resolve_provider, invoke_with_retry
 
 
 # ── Structured output schema ─────────────────────────────────────────
@@ -129,19 +113,15 @@ Bad (too vague): "High failure rate, placing first."
 
 # ── LLM call with rate-limit retry ───────────────────────────────────
 
-def _resolve_provider(model_name: str) -> str | None:
-    name = model_name.lower()
-    if "gemini" in name:
-        return "google_genai"
-    if name.startswith("claude"):
-        return "anthropic"
-    return None
+# _resolve_provider is now imported from llm_utils
 
 
 def _build_models(model_name: str, tools: list):
     """Initialize a chat model and return (tools-bound, structured-output) pair."""
-    provider = _resolve_provider(model_name)
-    base = init_chat_model(model_name, model_provider=provider, temperature=0)
+    provider = resolve_provider(model_name)
+    # o-series models (o1, o3) do not support temperature
+    kwargs = {"temperature": 0} if not (model_name.startswith("o1") or model_name.startswith("o3")) else {}
+    base = init_chat_model(model_name, model_provider=provider, **kwargs)
     return base.bind_tools(tools), base.with_structured_output(PrioritizedTests)
 
 
@@ -199,7 +179,7 @@ def _rank_batch(
 
     def call_llm(state: AgentState):
         msgs = [SystemMessage(content=RANKING_SYSTEM_PROMPT)] + state["messages"]
-        response = _invoke_with_retry(model_with_tools, msgs)
+        response = invoke_with_retry(model_with_tools, msgs, model_name=ranking_model)
         return {"messages": [response]}
 
     def call_tools(state: AgentState):
@@ -242,7 +222,7 @@ def _rank_batch(
 
     # ── Extract structured output ────────────────────────────────────
     final_content = result["messages"][-1].content
-    parsed = _invoke_with_retry(
+    parsed = invoke_with_retry(
         structured_model,
         [
             SystemMessage(
@@ -251,6 +231,7 @@ def _rank_batch(
             ),
             HumanMessage(content=final_content),
         ],
+        model_name=ranking_model
     )
 
     return [t.model_dump() for t in parsed.ranked_tests]

@@ -37,7 +37,7 @@ _batch_size = 40
 _filter_model = "gpt-4o-mini"
 _ranking_model = "gpt-4o"
 
-def evaluate(csv_path, verbose=False, eval_window=5, gap=65.0):
+def evaluate(csv_path, verbose=False, eval_window=5, gap=65.0, no_validation=False):
     """
     Rolling-window evaluation over the last `eval_window` builds.
 
@@ -82,6 +82,7 @@ def evaluate(csv_path, verbose=False, eval_window=5, gap=65.0):
             batch_size=_batch_size,
             filter_model=_filter_model,
             ranking_model=_ranking_model,
+            no_validation=no_validation,
         )
 
         if verbose:
@@ -155,6 +156,10 @@ def main():
         help="Path to the persistent results CSV. Existing rows are read on startup so already-"
              "evaluated datasets are skipped (automatic resume).",
     )
+    parser.add_argument(
+        "--no-validation", action="store_true",
+        help="Bypass the validation layer and deterministic fallback (use LLM output even if invalid)",
+    )
     args = parser.parse_args()
     _mode = AgentMode.PILOT if args.mode == "pilot" else AgentMode.PRODUCTION
     _batch_size = args.batch_size
@@ -181,6 +186,7 @@ def main():
             verbose=not args.quiet,
             eval_window=args.eval_window,
             gap=args.gap,
+            no_validation=args.no_validation,
         )
         print(f"APFD={a:.4f}  APFDc={ac:.4f}  P@10={p10:.4f}  (avg over {args.eval_window} builds)")
         return
@@ -235,6 +241,7 @@ def _evaluate_one(f: Path, args, results_csv: Path, lock: threading.Lock) -> tup
             verbose=False,  # parallel runs — verbose output would interleave
             eval_window=args.eval_window,
             gap=args.gap,
+            no_validation=args.no_validation,
         )
         elapsed = time.time() - start
         _append_result(results_csv, lock, {
