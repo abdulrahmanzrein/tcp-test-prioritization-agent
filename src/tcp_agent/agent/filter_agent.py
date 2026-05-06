@@ -16,6 +16,7 @@ Design
 """
 
 import json
+import logging
 import time
 import warnings
 
@@ -33,6 +34,8 @@ from tcp_agent.tools.feature_extractor import (
 
 
 from tcp_agent.utils.llm_utils import resolve_provider, invoke_with_retry
+
+logger = logging.getLogger(__name__)
 
 
 # ── Structured output schemas ────────────────────────────────────────
@@ -311,18 +314,43 @@ def run_filter_agent(
         parsed = _classify_batch(structured_model, filter_model, batch, failure_rates, exec_times)
 
         # merge classifications into result
+        batch_profiles = {int(p["test"]): p for p in batch}
         batch_test_ids = {p["test"] for p in batch}
         classified_ids = set()
 
         for cls in parsed.classifications:
             classified_ids.add(cls.test_id)
+            profile = batch_profiles.get(int(cls.test_id), {})
+            fr = float(failure_rates.get(cls.test_id, 0.0))
+            rec_recent = float(profile.get("REC_RecentFailRate", 0.0))
+            rec_last_verdict = float(profile.get("REC_LastVerdict", 0.0))
+
+            # Hard guardrails: do not allow tests with known failure evidence
+            # to fall into T6 due to LLM misclassification noise.
+            enforced_tier = int(cls.tier)
+            if rec_recent > 0 or rec_last_verdict != 0:
+                enforced_tier = min(enforced_tier, 2)
+            elif fr > 0:
+                enforced_tier = min(enforced_tier, 4)
+
+            if enforced_tier != int(cls.tier):
+                logger.warning(
+                    "Filter guardrail promoted test %s from T%s -> T%s (fr=%.4f, recent=%.4f, last_verdict=%.1f)",
+                    cls.test_id,
+                    cls.tier,
+                    enforced_tier,
+                    fr,
+                    rec_recent,
+                    rec_last_verdict,
+                )
+
             entry = {
                 "test_id": cls.test_id,
-                "tier": cls.tier,
+                "tier": enforced_tier,
                 "key_signals": cls.key_signals,
                 "avg_exec_time": exec_times.get(cls.test_id, 0.0),
             }
-            if cls.tier <= 5:
+            if entry["tier"] <= 5:
                 result.high_risk_tests.append(entry)
             else:
                 result.low_signal_tests.append(entry)
@@ -330,12 +358,60 @@ def run_filter_agent(
         # safety: any test the LLM missed gets classified as T6
         missed = batch_test_ids - classified_ids
         for tid in missed:
-            result.low_signal_tests.append({
+            profile = batch_profiles.get(int(tid), {})
+            fr = float(failure_rates.get(tid, 0.0))
+            rec_recent = float(profile.get("REC_RecentFailRate", 0.0))
+            rec_last_verdict = float(profile.get("REC_LastVerdict", 0.0))
+
+            # Apply the same guardrails for omitted tests so active/historical
+            # failures are never silently buried in T6.
+            if rec_recent > 0 or rec_last_verdict != 0:
+                tier = 2
+                reason = "missed_by_filter_promoted_t2"
+            elif fr > 0:
+                tier = 4
+                reason = "missed_by_filter_promoted_t4"
+            else:
+                tier = 6
+                reason = "missed_by_filter"
+
+            logger.warning(
+                "Filter missed test %s; assigned T%s (%s, fr=%.4f, recent=%.4f, last_verdict=%.1f)",
+                tid,
+                tier,
+                reason,
+                fr,
+                rec_recent,
+                rec_last_verdict,
+            )
+            entry = {
                 "test_id": tid,
-                "tier": 6,
-                "key_signals": ["missed_by_filter"],
+                "tier": tier,
+                "key_signals": [reason],
                 "avg_exec_time": exec_times.get(tid, 0.0),
-            })
+            }
+            if tier <= 5:
+                result.high_risk_tests.append(entry)
+            else:
+                result.low_signal_tests.append(entry)
+
+    # Guard against duplicate test IDs from structured-output glitches.
+    # Keep a single classification per test, preferring the highest-risk tier
+    # (smaller tier number) if conflicting entries exist.
+    test_order = {p["test"]: i for i, p in enumerate(risk_profiles)}
+    deduped: dict[int, dict] = {}
+    for entry in result.high_risk_tests + result.low_signal_tests:
+        tid = entry["test_id"]
+        current = deduped.get(tid)
+        if current is None or entry["tier"] < current["tier"]:
+            deduped[tid] = entry
+
+    merged = sorted(
+        deduped.values(),
+        key=lambda e: (test_order.get(e["test_id"], 10**9), e["tier"]),
+    )
+    result.high_risk_tests = [e for e in merged if e["tier"] <= 5]
+    result.low_signal_tests = [e for e in merged if e["tier"] > 5]
 
     result.metadata = {
         "total_tests": total_tests,

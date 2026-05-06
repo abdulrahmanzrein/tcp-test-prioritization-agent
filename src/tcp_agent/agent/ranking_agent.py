@@ -97,13 +97,13 @@ together.  All tools accept test_ids to filter for only the relevant tests.
 Your FINAL message must contain ONLY a JSON array (no markdown, no text before/after).
 Every high-risk test must appear exactly once.
 
-For each **reason**, write 2-3 sentences that:
-1. State which tier (T1-T5), what the tier means, and WHY the test belongs there.
-2. Name the specific feature values AND explain what they mean in plain English.
-3. Explain tie-breaking logic if relevant.
+For each **reason**, write EXACTLY ONE concise sentence (max ~35 words) that:
+1. States tier (T1-T5) and why the test belongs there.
+2. Mentions key feature values.
+3. Mentions tie-break logic only if it changed ordering.
 
 Good example:
-"Tier 1 (Persistent failure): This test fails in 100% of all builds (REC_TotalFailRate=1.0) — it is a guaranteed, persistent failure. At only 31ms average execution time (REC_RecentAvgExeTime), it is the cheapest T1 test, so it catches a fault with almost zero CI cost."
+"Tier 1: Persistent failure (REC_TotalFailRate=1.0); run early because it is guaranteed to fail and cheap (REC_RecentAvgExeTime=31ms)."
 
 Bad (too vague): "High failure rate, placing first."
 
@@ -132,10 +132,11 @@ def _chunk_list(lst: list, size: int) -> list[list]:
     return [lst[i : i + size] for i in range(0, len(lst), size)]
 
 
-# Max tests per ranking batch — keeps tool output within GPT-4o's 128K context.
-# 3 tools × ~30 features × 30 tests ≈ 25K tokens, well within limits.
-# Going larger trades a bit of LLM ranking-precision risk for fewer round trips.
-_RANKING_BATCH_SIZE = 15
+# Max tests per ranking batch.
+# Keep this conservative because long per-test reasons can hit structured-output
+# max_tokens limits (especially on Claude), causing truncated outputs and parse
+# failures.
+_RANKING_BATCH_SIZE = 8
 
 # How many ranking batches to run concurrently across threads.  Each batch is
 # an independent LangGraph instance with its own model/tools, so it's safe to

@@ -1,8 +1,20 @@
 #How many of the top k tests actually failed?
 def precision_at_k(ranked_df, k=10):
     top_k = ranked_df.head(k) #top k rows
-    failures_in_top_k = (top_k["Verdict"] != 0).sum() #all the rows that failed 
+    failures_in_top_k = (top_k["Verdict"] != 0).sum() #all the rows that failed
     return failures_in_top_k / k
+
+
+# Fraction of all failing tests captured in the top k. Returns 1.0 iff every
+# failure appears in the first k ranks. With more than k failures the cap is k/m.
+def failure_recall_at_k(ranked_df, k=10):
+    failures = ranked_df[ranked_df["Verdict"] != 0]
+    m = len(failures)
+    if m == 0:
+        return 1.0
+    top_k = ranked_df.head(k)
+    failures_in_top_k = (top_k["Verdict"] != 0).sum()
+    return failures_in_top_k / m
 
 #The earlier failures appear, the better. APFD converts that into a 0–1 score. Random order gets ~0.5. 
 def apfd(ranked_df):

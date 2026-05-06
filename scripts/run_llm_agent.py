@@ -19,14 +19,15 @@ warnings.filterwarnings("ignore", message=r"urllib3 v2 only supports OpenSSL")
 
 # Ensure src/ is importable when running this file directly.
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-load_dotenv(PROJECT_ROOT / ".env")
+# Force project-local keys to win over any stale shell-exported credentials.
+load_dotenv(PROJECT_ROOT / ".env", override=True)
 SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from tcp_agent.agent.tcp_agent import run_agent
 from tcp_agent.agent.ranker import build_ranked_df, normalize_ranked_items
-from tcp_agent.evaluation import apfd, apfdc, precision_at_k
+from tcp_agent.evaluation import apfd, apfdc, precision_at_k, failure_recall_at_k
 from tcp_agent.config import AgentMode
 from tcp_agent.data_cache import load_dataset
 import pandas as pd
@@ -37,39 +38,75 @@ _batch_size = 40
 _filter_model = "gpt-4o-mini"
 _ranking_model = "gpt-4o"
 
-def evaluate(csv_path, verbose=False, eval_window=5, gap=65.0, no_validation=False):
+def _print_diagnosis(ranked_df, target_build, build_idx, total_builds):
+    """Print a per-build failure breakdown: where each failing test was ranked."""
+    n = len(ranked_df)
+    failures = ranked_df[ranked_df["Verdict"] != 0]
+    m = len(failures)
+    build_apfd  = apfd(ranked_df)
+    build_apfdc = apfdc(ranked_df)
+    build_p10   = failure_recall_at_k(ranked_df, k=10)
+
+    print(f"\n  [Build {target_build}  ({build_idx+1}/{total_builds})  —  {m} failure(s) / {n} tests]")
+    if m == 0:
+        print("    (no failures — skipped by --failed-builds-only)")
+    else:
+        for idx, row in failures.iterrows():
+            rank = idx + 1
+            pct  = rank / n * 100
+            flag = "✓" if rank <= 10 else ("✗" if rank > n // 2 else "")
+            print(f"    rank {rank:>4} / {n}  ({pct:5.1f}%)  test {int(row['Test'])}  {flag}")
+    print(f"    APFD={build_apfd:.4f}  APFDc={build_apfdc:.4f}  P@10={build_p10:.4f}")
+
+
+def evaluate(
+    csv_path,
+    verbose=False,
+    eval_window=5,
+    gap=65.0,
+    no_validation=False,
+    failed_builds_only=False,
+    diagnose=False,
+):
     """
     Rolling-window evaluation over the last `eval_window` builds.
 
-    For each target build B in builds[-eval_window:]:
-      - history = all builds BEFORE B  (what the agent can see)
-      - target  = build B              (what we evaluate against)
-      The agent ranks tests on the history, then we score its ordering
-      against B's real verdicts.
+    When failed_builds_only=True, only builds that contain at least one test
+    failure are used as targets — zero-failure builds carry no ranking signal
+    and would inflate APFD/APFDc to 1.0.
 
-    Scores are averaged across all target builds, giving a much more
-    robust estimate than a single-build evaluation.
+    For each target build B:
+      - history = all builds BEFORE B  (what the agent can see)
+      - target  = build B              (what we score against)
     """
     df = load_dataset(csv_path)
-    builds = sorted(df["Build"].unique())
+    min_build = df["Build"].min()
 
-    # need at least eval_window + 1 builds (one for history, rest for targets)
-    if len(builds) < eval_window + 1:
-        eval_window = max(1, len(builds) - 1)
+    if failed_builds_only:
+        candidate_builds = sorted(df[df["Verdict"] != 0]["Build"].unique())
+    else:
+        candidate_builds = sorted(df["Build"].unique())
 
-    target_builds = builds[-eval_window:]   # last N builds to evaluate on
+    # drop the very first build — it has no history
+    eligible = [b for b in candidate_builds if b > min_build]
+
+    if not eligible:
+        return 0.0, 0.0, 0.0
+
+    if len(eligible) < eval_window:
+        eval_window = len(eligible)
+
+    target_builds = eligible[-eval_window:]
 
     all_apfd, all_apfdc, all_p10 = [], [], []
 
     for i, target_build in enumerate(target_builds):
-        # agent sees only builds BEFORE this target build
         history = df[df["Build"] < target_build]
         target  = df[df["Build"] == target_build]
 
         if history.empty:
-            continue  # skip if no history available
+            continue
 
-        # write history to a temp file
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".csv", delete=False, prefix="tcp_history_"
         ) as tmp:
@@ -93,7 +130,10 @@ def evaluate(csv_path, verbose=False, eval_window=5, gap=65.0, no_validation=Fal
         ranked_df = build_ranked_df(ranked, target)
         all_apfd.append(apfd(ranked_df))
         all_apfdc.append(apfdc(ranked_df))
-        all_p10.append(precision_at_k(ranked_df, k=10))
+        all_p10.append(failure_recall_at_k(ranked_df, k=10))
+
+        if diagnose:
+            _print_diagnosis(ranked_df, target_build, i, len(target_builds))
 
         # rate-limit gap between agent calls (skip after the last one)
         if i < len(target_builds) - 1 and gap > 0:
@@ -160,6 +200,17 @@ def main():
         "--no-validation", action="store_true",
         help="Bypass the validation layer and deterministic fallback (use LLM output even if invalid)",
     )
+    parser.add_argument(
+        "--failed-builds-only",
+        action="store_true",
+        help="Only evaluate on builds that contain at least one test failure. "
+             "Zero-failure builds carry no signal and inflate APFD/APFDc to 1.0.",
+    )
+    parser.add_argument(
+        "--diagnose-failures",
+        action="store_true",
+        help="After each build, print a breakdown of where each failing test was ranked.",
+    )
     args = parser.parse_args()
     _mode = AgentMode.PILOT if args.mode == "pilot" else AgentMode.PRODUCTION
     _batch_size = args.batch_size
@@ -187,6 +238,8 @@ def main():
             eval_window=args.eval_window,
             gap=args.gap,
             no_validation=args.no_validation,
+            failed_builds_only=args.failed_builds_only,
+            diagnose=args.diagnose_failures,
         )
         print(f"APFD={a:.4f}  APFDc={ac:.4f}  P@10={p10:.4f}  (avg over {args.eval_window} builds)")
         return
@@ -242,6 +295,8 @@ def _evaluate_one(f: Path, args, results_csv: Path, lock: threading.Lock) -> tup
             eval_window=args.eval_window,
             gap=args.gap,
             no_validation=args.no_validation,
+            failed_builds_only=args.failed_builds_only,
+            diagnose=args.diagnose_failures,
         )
         elapsed = time.time() - start
         _append_result(results_csv, lock, {
