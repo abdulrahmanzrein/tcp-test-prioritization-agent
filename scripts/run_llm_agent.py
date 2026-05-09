@@ -35,10 +35,12 @@ import pandas as pd
 # default settings — can be overridden via CLI
 _mode = AgentMode.PILOT
 _batch_size = 40
-_filter_model = "gpt-4o-mini"
+_filter_model = "mistral-medium-latest"
 _ranking_model = "gpt-4o"
 
-def _print_diagnosis(ranked_df, target_build, build_idx, total_builds):
+def _print_diagnosis(
+    ranked_df, target_build, build_idx, total_builds, *, failed_builds_only: bool
+):
     """Print a per-build failure breakdown: where each failing test was ranked."""
     n = len(ranked_df)
     failures = ranked_df[ranked_df["Verdict"] != 0]
@@ -49,7 +51,10 @@ def _print_diagnosis(ranked_df, target_build, build_idx, total_builds):
 
     print(f"\n  [Build {target_build}  ({build_idx+1}/{total_builds})  —  {m} failure(s) / {n} tests]")
     if m == 0:
-        print("    (no failures — skipped by --failed-builds-only)")
+        if failed_builds_only:
+            print("    (no failures in target build — unexpected for --failed-builds-only mode)")
+        else:
+            print("    (no failures in this build)")
     else:
         for idx, row in failures.iterrows():
             rank = idx + 1
@@ -91,7 +96,7 @@ def evaluate(
     eligible = [b for b in candidate_builds if b > min_build]
 
     if not eligible:
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0
 
     if len(eligible) < eval_window:
         eval_window = len(eligible)
@@ -133,19 +138,24 @@ def evaluate(
         all_p10.append(failure_recall_at_k(ranked_df, k=10))
 
         if diagnose:
-            _print_diagnosis(ranked_df, target_build, i, len(target_builds))
+            _print_diagnosis(
+                ranked_df, target_build, i, len(target_builds),
+                failed_builds_only=failed_builds_only,
+            )
 
         # rate-limit gap between agent calls (skip after the last one)
         if i < len(target_builds) - 1 and gap > 0:
             time.sleep(gap)
 
     if not all_apfd:
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0
 
+    n = len(all_apfd)
     return (
-        sum(all_apfd)  / len(all_apfd),
-        sum(all_apfdc) / len(all_apfdc),
-        sum(all_p10)   / len(all_p10),
+        sum(all_apfd)  / n,
+        sum(all_apfdc) / n,
+        sum(all_p10)   / n,
+        n,
     )
 
 
@@ -169,8 +179,8 @@ def main():
              "token-limit errors; lower if you see frequent splits.",
     )
     parser.add_argument(
-        "--filter-model", type=str, default="gpt-4o-mini",
-        help="LLM model for the Filter Agent (default: gpt-4o-mini)",
+        "--filter-model", type=str, default="mistral-medium-latest",
+        help="LLM model for the Filter Agent (default: mistral-medium-latest)",
     )
     parser.add_argument(
         "--ranking-model", type=str, default="gpt-4o",
@@ -202,9 +212,17 @@ def main():
     )
     parser.add_argument(
         "--failed-builds-only",
+        dest="failed_builds_only",
         action="store_true",
-        help="Only evaluate on builds that contain at least one test failure. "
+        default=True,
+        help="Only evaluate on builds that contain at least one test failure (default: on). "
              "Zero-failure builds carry no signal and inflate APFD/APFDc to 1.0.",
+    )
+    parser.add_argument(
+        "--all-builds",
+        dest="failed_builds_only",
+        action="store_false",
+        help="Evaluate on every eligible build, including those with no failing tests.",
     )
     parser.add_argument(
         "--diagnose-failures",
@@ -224,6 +242,8 @@ def main():
             needed_keys.add("GOOGLE_API_KEY")
         elif name.startswith("claude"):
             needed_keys.add("ANTHROPIC_API_KEY")
+        elif "mistral" in name:
+            needed_keys.add("MISTRAL_API_KEY")
         else:
             needed_keys.add("OPENAI_API_KEY")
 
@@ -232,7 +252,7 @@ def main():
         sys.exit(f"Missing required API key(s): {', '.join(missing)}")
 
     if args.data:
-        a, ac, p10 = evaluate(
+        a, ac, p10, n_b = evaluate(
             args.data,
             verbose=not args.quiet,
             eval_window=args.eval_window,
@@ -241,22 +261,34 @@ def main():
             failed_builds_only=args.failed_builds_only,
             diagnose=args.diagnose_failures,
         )
-        print(f"APFD={a:.4f}  APFDc={ac:.4f}  P@10={p10:.4f}  (avg over {args.eval_window} builds)")
+        print(
+            f"APFD={a:.4f}  APFDc={ac:.4f}  P@10={p10:.4f}  "
+            f"(avg over {n_b} build(s){'; failed-builds only' if args.failed_builds_only else ''})"
+        )
         return
 
     _run_data_dir(args)
 
 
-def _load_completed(results_csv: Path) -> set[str]:
-    """Return the set of dataset filenames already present in the results CSV.
-    Used to skip datasets we've already evaluated (automatic resume on rerun)."""
+def _normalize_failed_builds_flag(raw: str) -> bool:
+    return raw.strip().lower() in ("1", "true", "yes", "y")
+
+
+def _load_completed(results_csv: Path) -> set[tuple[str, bool]]:
+    """Rows with status ok: (dataset filename, failed_builds_only).
+
+    Older result files omit failed_builds_only — treated as False so resume
+    behavior matches historical runs."""
     if not results_csv.exists():
         return set()
-    done = set()
+    done: set[tuple[str, bool]] = set()
     with open(results_csv, newline="") as f:
         for row in csv.DictReader(f):
-            if row.get("dataset"):
-                done.add(row["dataset"])
+            if row.get("status") != "ok" or not row.get("dataset"):
+                continue
+            key = row["dataset"]
+            fbo = _normalize_failed_builds_flag(row.get("failed_builds_only", ""))
+            done.add((key, fbo))
     return done
 
 
@@ -270,7 +302,7 @@ def _append_result(results_csv: Path, lock: threading.Lock, row: dict):
     results_csv.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
         "dataset", "apfd", "apfdc", "p_at_10",
-        "filter_model", "ranking_model", "eval_window",
+        "filter_model", "ranking_model", "eval_window", "failed_builds_only",
         "wall_seconds", "timestamp", "status", "error",
     ]
     with lock:
@@ -289,7 +321,7 @@ def _evaluate_one(f: Path, args, results_csv: Path, lock: threading.Lock) -> tup
     Returns (path, status_string) for the progress log."""
     start = time.time()
     try:
-        a, ac, p10 = evaluate(
+        a, ac, p10, n_b = evaluate(
             f,
             verbose=False,  # parallel runs — verbose output would interleave
             eval_window=args.eval_window,
@@ -307,12 +339,14 @@ def _evaluate_one(f: Path, args, results_csv: Path, lock: threading.Lock) -> tup
             "filter_model": _filter_model,
             "ranking_model": _ranking_model,
             "eval_window": args.eval_window,
+            "failed_builds_only": "1" if args.failed_builds_only else "0",
             "wall_seconds": f"{elapsed:.1f}",
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "status": "ok",
             "error": "",
         })
-        return f, f"OK\tAPFD={a:.4f}\tAPFDc={ac:.4f}\tP@10={p10:.4f}\t({elapsed:.0f}s)"
+        fbo_note = "fbo" if args.failed_builds_only else "all"
+        return f, f"OK\tAPFD={a:.4f}\tAPFDc={ac:.4f}\tP@10={p10:.4f}\t{n_b}b\t{fbo_note}\t({elapsed:.0f}s)"
     except Exception as e:
         elapsed = time.time() - start
         _append_result(results_csv, lock, {
@@ -321,6 +355,7 @@ def _evaluate_one(f: Path, args, results_csv: Path, lock: threading.Lock) -> tup
             "filter_model": _filter_model,
             "ranking_model": _ranking_model,
             "eval_window": args.eval_window,
+            "failed_builds_only": "1" if args.failed_builds_only else "0",
             "wall_seconds": f"{elapsed:.1f}",
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "status": "failed",
@@ -334,17 +369,21 @@ def _run_data_dir(args):
     results_csv = args.results_csv
     completed = _load_completed(results_csv)
 
-    pending = [f for f in files if f.name not in completed]
+    pending = [f for f in files if (f.name, args.failed_builds_only) not in completed]
     skipped = len(files) - len(pending)
+    mode = "failed-builds only" if args.failed_builds_only else "all builds"
     if skipped:
-        print(f"[resume] {skipped}/{len(files)} datasets already in {results_csv} — skipping", flush=True)
+        print(
+            f"[resume] {skipped}/{len(files)} datasets ({mode}) already in {results_csv} — skipping",
+            flush=True,
+        )
     if not pending:
         print("[resume] nothing to do — all datasets evaluated", flush=True)
         return
 
     print(
         f"[start] {len(pending)} datasets, workers={args.workers}, "
-        f"filter={_filter_model}, ranking={_ranking_model}",
+        f"filter={_filter_model}, ranking={_ranking_model}, eval={mode}",
         flush=True,
     )
 

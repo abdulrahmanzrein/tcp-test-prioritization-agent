@@ -31,7 +31,7 @@ def run_multi_agent(
     dataset_path,
     mode: AgentMode = AgentMode.PILOT,
     batch_size: int = 200,
-    filter_model: str = "gpt-4o-mini",
+    filter_model: str = "mistral-medium-latest",
     ranking_model: str = "gpt-4o",
     no_validation: bool = False,
 ):
@@ -90,7 +90,7 @@ def run_agent(
     dataset_path,
     mode: AgentMode = AgentMode.PILOT,
     batch_size: int = 200,
-    filter_model: str = "gpt-4o-mini",
+    filter_model: str = "mistral-medium-latest",
     ranking_model: str = "gpt-4o",
     no_validation: bool = False,
 ):

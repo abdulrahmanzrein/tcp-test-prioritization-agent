@@ -293,7 +293,7 @@ def _classify_batch(
 def run_filter_agent(
     dataset_path: str,
     batch_size: int = 40,
-    filter_model: str = "gpt-4o-mini",
+    filter_model: str = "mistral-medium-latest",
 ) -> FilterResult:
     """Run the Filter Agent over the dataset.
 

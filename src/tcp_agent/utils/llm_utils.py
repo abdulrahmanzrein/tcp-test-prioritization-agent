@@ -15,6 +15,8 @@ def resolve_provider(model_name: str) -> str | None:
         return "google_genai"
     if name.startswith("claude"):
         return "anthropic"
+    if "mistral" in name:
+        return "mistralai"
     if name.startswith("o1") or name.startswith("o3"):
         return "openai"
     return None
