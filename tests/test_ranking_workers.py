@@ -10,7 +10,13 @@ import concurrent.futures
 from unittest.mock import patch
 
 from tcp_agent.agent.filter_agent import FilterResult
-from tcp_agent.agent.ranking_agent import run_ranking_agent
+from tcp_agent.agent.ranking_agent import (
+    PrioritizedTests,
+    RankedTest,
+    RANKING_SYSTEM_PROMPT,
+    _extract_ranked_tests,
+    run_ranking_agent,
+)
 
 
 def _make_filter_result(num_high_risk: int) -> FilterResult:
@@ -124,3 +130,56 @@ def test_ranking_does_not_recover_missing_or_placeholder_ids():
         result = run_ranking_agent(filter_result, dataset_path="fake.csv", ranking_model="m")
 
     assert [item["test"] for item in result] == ["1000", "{TEST_ID}"]
+
+
+def test_ranking_prompt_does_not_contain_copyable_placeholder_id():
+    assert "{TEST_ID}" not in RANKING_SYSTEM_PROMPT
+    assert "{test_id}" not in RANKING_SYSTEM_PROMPT
+    assert '"test":"id"' not in RANKING_SYSTEM_PROMPT
+
+
+def test_extract_ranked_tests_uses_direct_json_without_second_llm():
+    class FailingStructuredModel:
+        def invoke(self, messages):
+            raise AssertionError("structured extraction should not run")
+
+    content = (
+        '[{"test":"1000","priority":1,"confidence":0.9,"reason":"Tier 2: recent failure."},'
+        '{"test":"1001","priority":2,"confidence":0.8,"reason":"Tier 4: history."}]'
+    )
+
+    result = _extract_ranked_tests(
+        final_content=content,
+        structured_model=FailingStructuredModel(),
+        batch_ids=[1000, 1001],
+        ranking_model="fake",
+    )
+
+    assert [item["test"] for item in result] == ["1000", "1001"]
+
+
+def test_extract_ranked_tests_repairs_placeholder_ids_with_llm_retry():
+    class RepairStructuredModel:
+        def __init__(self):
+            self.calls = 0
+
+        def invoke(self, messages):
+            self.calls += 1
+            return PrioritizedTests(
+                ranked_tests=[
+                    RankedTest(test="1000", priority=1, confidence=0.9, reason="valid"),
+                    RankedTest(test="1001", priority=2, confidence=0.8, reason="repaired"),
+                ]
+            )
+
+    model = RepairStructuredModel()
+
+    result = _extract_ranked_tests(
+        final_content='[{"test":"1000"},{"test":"{TEST_ID}"}]',
+        structured_model=model,
+        batch_ids=[1000, 1001],
+        ranking_model="fake",
+    )
+
+    assert model.calls == 1
+    assert [item["test"] for item in result] == ["1000", "1001"]

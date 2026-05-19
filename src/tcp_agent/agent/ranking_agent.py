@@ -17,6 +17,7 @@ Design
 """
 
 import operator
+import json
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -112,7 +113,8 @@ Good example:
 
 Bad (too vague): "High failure rate, placing first."
 
-[{\"test\":\"id\",\"priority\":1,\"confidence\":0.9,\"reason\":\"...\"}]
+Use this shape, but replace test values with the exact IDs provided in the task:
+[{\"test\":\"123\",\"priority\":1,\"confidence\":0.9,\"reason\":\"Tier 2: ...\"}]
 """
 
 
@@ -136,6 +138,154 @@ def _build_models(model_name: str, tools: list):
 def _chunk_list(lst: list, size: int) -> list[list]:
     """Split a list into chunks of the given size."""
     return [lst[i : i + size] for i in range(0, len(lst), size)]
+
+
+def _coerce_ranked_tests(items: list) -> list[dict]:
+    ranked = []
+    for item in items:
+        if isinstance(item, BaseModel):
+            ranked.append(item.model_dump())
+        elif isinstance(item, dict):
+            ranked.append(dict(item))
+    return ranked
+
+
+def _extract_json_array(text: str) -> list[dict] | None:
+    content = text.strip()
+    if content.startswith("```"):
+        lines = content.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        content = "\n".join(lines).strip()
+
+    start = content.find("[")
+    end = content.rfind("]")
+    if start == -1 or end == -1 or end < start:
+        return None
+
+    try:
+        parsed = json.loads(content[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, list):
+        return None
+    return _coerce_ranked_tests(parsed)
+
+
+def _batch_validation_errors(ranked: list[dict], batch_ids: list[int]) -> list[str]:
+    allowed = set(batch_ids)
+    ids = []
+    errors = []
+
+    for idx, item in enumerate(ranked):
+        if not isinstance(item, dict):
+            errors.append(f"Item {idx} is not an object")
+            continue
+        for key in ("test", "priority", "confidence", "reason"):
+            if key not in item:
+                errors.append(f"Item {idx} missing key: {key}")
+        try:
+            tid = int(item.get("test"))
+        except (TypeError, ValueError):
+            errors.append(f"Invalid test ID: {item.get('test')!r}")
+            continue
+        ids.append(tid)
+        if tid not in allowed:
+            errors.append(f"Unknown test ID: {tid}")
+
+    seen = set()
+    dupes = []
+    for tid in ids:
+        if tid in seen:
+            dupes.append(tid)
+        seen.add(tid)
+    if dupes:
+        errors.append(f"Duplicate test ID(s): {sorted(set(dupes))}")
+
+    missing = allowed - set(ids)
+    if missing:
+        errors.append(f"Missing test ID(s): {sorted(missing)}")
+
+    return errors
+
+
+def _structured_extract(structured_model, final_content: str, ranking_model: str):
+    parsed = invoke_with_retry(
+        structured_model,
+        [
+            SystemMessage(
+                content=(
+                    "Extract the test prioritization from this message into the schema. "
+                    "Use only concrete numeric test IDs that appear in the message. "
+                    "Never use placeholders."
+                )
+            ),
+            HumanMessage(content=final_content),
+        ],
+        model_name=ranking_model,
+    )
+    return _coerce_ranked_tests(parsed.ranked_tests)
+
+
+def _repair_ranked_tests(
+    structured_model,
+    ranked: list[dict],
+    errors: list[str],
+    batch_ids: list[int],
+    ranking_model: str,
+) -> list[dict]:
+    parsed = invoke_with_retry(
+        structured_model,
+        [
+            SystemMessage(
+                content=(
+                    "Repair this ranking output. Return every allowed test ID exactly once. "
+                    "Do not invent IDs. Do not use placeholders. Keep the ranking intent "
+                    "from the previous output when possible."
+                )
+            ),
+            HumanMessage(
+                content=(
+                    f"Allowed test IDs: {batch_ids}\n"
+                    f"Validation errors: {errors}\n"
+                    f"Previous output: {json.dumps(ranked, separators=(',', ':'))}"
+                )
+            ),
+        ],
+        model_name=ranking_model,
+    )
+    return _coerce_ranked_tests(parsed.ranked_tests)
+
+
+def _extract_ranked_tests(
+    final_content: str,
+    structured_model,
+    batch_ids: list[int],
+    ranking_model: str,
+) -> list[dict]:
+    """Extract and LLM-repair a batch ranking without deterministic re-ranking."""
+    ranked = _extract_json_array(final_content)
+    if ranked is None:
+        ranked = _structured_extract(structured_model, final_content, ranking_model)
+
+    errors = _batch_validation_errors(ranked, batch_ids)
+    if not errors:
+        return ranked
+
+    repaired = _repair_ranked_tests(
+        structured_model=structured_model,
+        ranked=ranked,
+        errors=errors,
+        batch_ids=batch_ids,
+        ranking_model=ranking_model,
+    )
+    repaired_errors = _batch_validation_errors(repaired, batch_ids)
+    if not repaired_errors:
+        return repaired
+
+    return ranked
 
 
 # Max tests per ranking batch.
@@ -227,21 +377,12 @@ def _rank_batch(
         )]
     })
 
-    # ── Extract structured output ────────────────────────────────────
-    final_content = result["messages"][-1].content
-    parsed = invoke_with_retry(
-        structured_model,
-        [
-            SystemMessage(
-                content="Extract the test prioritization from this message into the schema. "
-                        "Keep all reasons intact."
-            ),
-            HumanMessage(content=final_content),
-        ],
-        model_name=ranking_model
+    return _extract_ranked_tests(
+        final_content=result["messages"][-1].content,
+        structured_model=structured_model,
+        batch_ids=batch_ids,
+        ranking_model=ranking_model,
     )
-
-    return [t.model_dump() for t in parsed.ranked_tests]
 
 
 def run_ranking_agent(
