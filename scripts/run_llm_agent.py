@@ -230,7 +230,7 @@ def main():
     )
     parser.add_argument(
         "--no-validation", action="store_true",
-        help="Bypass the validation layer and deterministic fallback (use LLM output even if invalid)",
+        help="Bypass the validation layer (use LLM output even if invalid)",
     )
     parser.add_argument(
         "--failed-builds-only",

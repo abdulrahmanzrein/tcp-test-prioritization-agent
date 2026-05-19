@@ -7,8 +7,8 @@ LLM-driven **test case prioritization (TCP)** for **Continuous Integration**, ev
 ## What this repo does
 
 1. **Filter Agent** — Classifies every test into **T1–T5** (high-risk) or **T6** (low-signal) using structured output and batched prompts. Features come from **`feature_extractor`** (pure Python on the CSV), not tool calls.
-2. **Ranking Agent** — For **T1–T5 only**, runs a **LangGraph** tool loop (`get_test_risk_profile`, `get_test_complexity`, `get_covered_code_risk`), then structured extraction of the final ordering. **T6** is appended deterministically (by average execution time).
-3. **Validator** — Checks completeness / IDs / duplicates; on failure, **`deterministic_fallback`** produces a valid ranking from latest CSV rows.
+2. **Ranking Agent** — For **T1–T5 only**, runs a **LangGraph** tool loop (`get_test_risk_profile`, `get_test_complexity`, `get_covered_code_risk`), then structured extraction of the final ordering. **T6** was already filtered by the LLM and is appended after the high-risk list to save ranking context.
+3. **Validator** — Checks completeness / IDs / duplicates; invalid LLM output fails loudly instead of being replaced by a formula ranker.
 
 Research context: **Yaraghi et al. (TCP-CI)** — comprehensive features and REC-heavy importance; **Mendoza et al. (PROMISE ’22)** — imbalance and APFDc-focused ML-TCP (your LLM path does not apply SMOTE; the RF baseline does).
 
@@ -129,10 +129,10 @@ tcp-test-prioritization-agent/
 ├── .env                      # API keys (not committed)
 └── src/tcp_agent/
     ├── agent/
-    │   ├── tcp_agent.py      # run_agent → Filter → Ranking → validate / fallback
+    │   ├── tcp_agent.py      # run_agent → Filter → Ranking → validate
     │   ├── filter_agent.py   # T1–T6 classification
     │   ├── ranking_agent.py  # LangGraph ranking for T1–T5
-    │   ├── validator.py      # Checks + deterministic_fallback
+    │   ├── validator.py      # Output checks; no ranking fallback
     │   └── ranker.py         # normalize_ranked_items, build_ranked_df
     ├── tools/
     │   ├── feature_extractor.py   # CSV features for Filter (no LLM tools)

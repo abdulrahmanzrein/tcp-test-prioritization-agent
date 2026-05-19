@@ -5,14 +5,15 @@ Ranking Agent — "The Expert"
 
 Takes the filtered high-risk tests (T1–T5) from the Filter Agent and
 performs deep, research-grounded reasoning to produce the final ranked
-output.  T6 tests are appended deterministically without LLM reasoning.
+output.  T6 tests were already filtered by the LLM and are appended after
+the high-risk list to save ranking context.
 
 Design
 ------
 1. Uses a LangGraph tool-calling loop (same pattern as the original agent)
    but only requests tool data for the high-risk subset (via test_ids filter).
 2. Produces full 2-3 sentence justifications per test.
-3. Appends T6 tail sorted by execution cost ascending.
+3. Appends the Filter Agent's T6 tail after the ranked high-risk tests.
 """
 
 import operator
@@ -328,30 +329,6 @@ def run_ranking_agent(
     for item in all_ranked:
         item.pop("_batch_idx", None)
 
-    # ── Recover any high-risk tests the LLM dropped ──────────────────
-    # gpt-4o-mini occasionally truncates JSON arrays — append missing tests
-    # before validation so the LLM's good rankings aren't discarded just
-    # because a few items got dropped from a long structured-output list.
-    returned_ids = {str(item["test"]) for item in all_ranked}
-    missing = [t for t in high_risk_tests if str(t["test_id"]) not in returned_ids]
-    if missing:
-        print(
-            f"  [RANKING] LLM dropped {len(missing)} high-risk test(s); "
-            f"appending with conservative fallback reason."
-        )
-        for t in missing:
-            all_ranked.append({
-                "test": str(t["test_id"]),
-                "priority": 0,  # re-numbered below
-                "confidence": 0.4,
-                "reason": (
-                    f"Tier {t.get('tier', 5)} (LLM-dropped recovery): The Filter Agent "
-                    f"flagged this as high-risk but the Ranking Agent omitted it from its "
-                    f"output. Appended at the end of the high-risk section. "
-                    f"Filter signals: {', '.join(t.get('key_signals', []))}."
-                ),
-            })
-
     # ── Re-number priorities sequentially ────────────────────────────
     for i, item in enumerate(all_ranked):
         item["priority"] = i + 1
@@ -365,7 +342,7 @@ def run_ranking_agent(
 
 
 def _build_t6_tail(low_signal_tests: list[dict], start_priority: int) -> list[dict]:
-    """Build the deterministic T6 tail sorted by execution cost ascending."""
+    """Build the T6 tail from tests the Filter Agent already marked low-signal."""
     sorted_t6 = sorted(low_signal_tests, key=lambda t: t.get("avg_exec_time", 0.0))
 
     tail = []

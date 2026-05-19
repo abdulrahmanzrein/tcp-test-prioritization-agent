@@ -123,20 +123,3 @@ def extract_all_test_ids(dataset_path: str) -> set:
     df = load_dataset(dataset_path)
     return set(df["Test"].unique().tolist())
 
-
-def extract_latest_features_for_fallback(dataset_path: str) -> pd.DataFrame:
-    """Return a DataFrame with the latest build snapshot for all tests,
-    including the key columns needed by the deterministic fallback ranker.
-
-    Columns guaranteed present (if they exist in the dataset):
-        Test, REC_TotalFailRate, REC_RecentFailRate, DET_COV_C_Faults,
-        DET_COV_IMP_Faults, REC_RecentAvgExeTime
-    """
-    df = load_dataset(dataset_path)
-    latest = (
-        df.sort_values("Build", ascending=False)
-        .groupby("Test")
-        .first()
-        .reset_index()
-    )
-    return latest

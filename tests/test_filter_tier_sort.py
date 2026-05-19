@@ -1,14 +1,4 @@
-"""Bug 1 regression test: high_risk_tests must be ordered primarily by tier,
-not by REC_RecentFailRate.
-
-Before the fix, the merge sorted by (test_order_position, tier) where
-test_order_position came from extract_risk_profiles which sorts by
-REC_RecentFailRate descending. This caused T1 tests with low recent failure
-rates to land in late ranking batches, ranking them below T2 tests.
-
-After the fix, T1 tests must always appear before T2 tests in high_risk_tests,
-regardless of REC_RecentFailRate.
-"""
+"""Filter output preserves the LLM's tier decisions and ordering."""
 from __future__ import annotations
 
 import csv
@@ -66,17 +56,14 @@ def _write_csv(path: Path) -> None:
         w.writerows(rows)
 
 
-def test_t1_outranks_t2_regardless_of_recent_fail_rate(tmp_path: Path):
+def test_filter_preserves_llm_order_without_tier_sorting(tmp_path: Path):
     csv_path = tmp_path / "tiny.csv"
     _write_csv(csv_path)
 
-    # Mock the LLM: classify test 100 as T1 and test 200 as T2.
-    # The guardrail will keep test 100 at T1 (no recent failure evidence) and
-    # cap test 200 at T2 (rec_recent=0.9 > 0).
     fake_result = BatchClassificationResult(
         classifications=[
-            TestClassification(test_id=100, tier=1, key_signals=["REC_TotalFailRate=0.8"]),
             TestClassification(test_id=200, tier=2, key_signals=["REC_RecentFailRate=0.9"]),
+            TestClassification(test_id=100, tier=1, key_signals=["REC_TotalFailRate=0.8"]),
         ]
     )
 
@@ -92,8 +79,5 @@ def test_t1_outranks_t2_regardless_of_recent_fail_rate(tmp_path: Path):
     ids_in_order = [e["test_id"] for e in result.high_risk_tests]
     tiers_in_order = [e["tier"] for e in result.high_risk_tests]
 
-    assert ids_in_order == [100, 200], (
-        f"T1 test should appear before T2 test regardless of REC_RecentFailRate; "
-        f"got order={ids_in_order} tiers={tiers_in_order}"
-    )
-    assert tiers_in_order == [1, 2]
+    assert ids_in_order == [200, 100]
+    assert tiers_in_order == [2, 1]

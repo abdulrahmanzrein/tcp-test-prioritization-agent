@@ -85,3 +85,42 @@ def test_ranking_workers_uses_threadpool_when_gt_one():
     args = spy_pool.call_args.args
     max_workers = kwargs.get("max_workers", args[0] if args else None)
     assert max_workers == 3, f"Expected max_workers=3, got {max_workers}"
+
+
+def test_ranking_keeps_low_signal_tests_out_of_llm_batches_and_appends_tail():
+    """T6 was already decided by the Filter LLM, so ranking should save context."""
+    filter_result = _make_filter_result(num_high_risk=3)
+    filter_result.low_signal_tests = [
+        {"test_id": 2000, "tier": 6, "key_signals": ["none"], "avg_exec_time": 1.0},
+        {"test_id": 2001, "tier": 6, "key_signals": ["none"], "avg_exec_time": 2.0},
+    ]
+    filter_result.metadata["total_tests"] = 5
+    filter_result.metadata["low_signal_count"] = 2
+
+    def fake_rank_batch(batch_tests, batch_ids, **_kwargs):
+        assert batch_ids == [1000, 1001, 1002]
+        return [
+            {"test": str(tid), "priority": i + 1, "confidence": 0.5, "reason": "llm"}
+            for i, tid in enumerate(batch_ids)
+        ]
+
+    with patch("tcp_agent.agent.ranking_agent._rank_batch", side_effect=fake_rank_batch):
+        result = run_ranking_agent(filter_result, dataset_path="fake.csv", ranking_model="m")
+
+    assert [item["test"] for item in result] == ["1000", "1001", "1002", "2000", "2001"]
+
+
+def test_ranking_does_not_recover_missing_or_placeholder_ids():
+    """Malformed Qwen/Ollama rows should fail validation instead of being repaired."""
+    filter_result = _make_filter_result(num_high_risk=3)
+
+    def fake_rank_batch(batch_tests, batch_ids, **_kwargs):
+        return [
+            {"test": str(batch_ids[0]), "priority": 1, "confidence": 0.8, "reason": "valid"},
+            {"test": "{TEST_ID}", "priority": 2, "confidence": 0.5, "reason": "placeholder"},
+        ]
+
+    with patch("tcp_agent.agent.ranking_agent._rank_batch", side_effect=fake_rank_batch):
+        result = run_ranking_agent(filter_result, dataset_path="fake.csv", ranking_model="m")
+
+    assert [item["test"] for item in result] == ["1000", "{TEST_ID}"]

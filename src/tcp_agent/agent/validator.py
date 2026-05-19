@@ -6,17 +6,12 @@ Output Validation Layer
 Sits between the LLM ranking and final result acceptance.  Catches
 malformed, incomplete, or rule-violating output before it silently
 degrades TCP quality.
-
-If validation fails, a deterministic fallback ranker is used instead.
 """
 
 import logging
 from dataclasses import dataclass, field
 
-import pandas as pd
-
 from tcp_agent.agent.filter_agent import FilterResult
-from tcp_agent.tools.feature_extractor import extract_latest_features_for_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -162,93 +157,6 @@ def validate_ranking(
             )
 
     return vr
-
-
-# ── Deterministic fallback ranker ────────────────────────────────────
-
-# Weights for the fallback scoring formula
-_W_TOTAL_FAIL_RATE = 5.0
-_W_RECENT_FAIL_RATE = 3.0
-_W_DET_COV_FAULTS = 2.0
-_W_EXEC_TIME = 0.001
-
-
-def deterministic_fallback(dataset_path: str) -> list[dict]:
-    """Score-based fallback that guarantees a valid ranking.
-
-    Uses:  score = 5*failure_rate + 3*recent_fail_rate + 2*det_cov_faults - 0.001*exec_time
-    Higher score = higher priority (run first).
-
-    Parameters
-    ----------
-    dataset_path : str
-        Path to the CSV dataset.
-
-    Returns
-    -------
-    list[dict]
-        Ranked list in the same schema as the LLM output.
-    """
-    logger.warning("Using deterministic fallback ranker (LLM output failed validation)")
-    latest = extract_latest_features_for_fallback(dataset_path)
-
-    # compute score — replace -1 sentinels BEFORE scoring
-    def _safe_col(df, col, default=0.0):
-        if col not in df.columns:
-            return default
-        return df[col].replace(-1, 0).fillna(default)
-
-    latest = latest.copy()
-    latest["_score"] = (
-        _W_TOTAL_FAIL_RATE * _safe_col(latest, "REC_TotalFailRate")
-        + _W_RECENT_FAIL_RATE * _safe_col(latest, "REC_RecentFailRate")
-        + _W_DET_COV_FAULTS * (
-            _safe_col(latest, "DET_COV_C_Faults")
-            + _safe_col(latest, "DET_COV_IMP_Faults")
-        )
-        - _W_EXEC_TIME * _safe_col(latest, "REC_RecentAvgExeTime")
-    )
-
-    # floor at 0 (only matters if exec_time penalty dominates a zero-signal test)
-    latest["_score"] = latest["_score"].clip(lower=0)
-
-    # sort by score descending, then by exec time ascending for ties
-    latest = latest.sort_values(
-        ["_score", "REC_RecentAvgExeTime"],
-        ascending=[False, True],
-    ).reset_index(drop=True)
-
-    # build output
-    ranked = []
-    for i, row in latest.iterrows():
-        tid = int(row["Test"])
-        score = round(row["_score"], 4)
-        fail_rate = round(row.get("REC_TotalFailRate", 0) if row.get("REC_TotalFailRate", -1) != -1 else 0, 4)
-        exec_time = round(row.get("REC_RecentAvgExeTime", 0) if row.get("REC_RecentAvgExeTime", -1) != -1 else 0, 2)
-
-        if fail_rate > 0:
-            reason = (
-                f"Deterministic fallback: score={score} "
-                f"(failure_rate={fail_rate}, exec_time={exec_time}ms). "
-                f"Ranked by weighted formula: 5×fail_rate + 3×recent_fail + 2×det_cov − 0.001×cost."
-            )
-            confidence = min(0.7, score / 8.0)
-        else:
-            reason = (
-                f"Deterministic fallback (T6): No failure history. "
-                f"Sorted by execution cost ({exec_time}ms ascending). "
-                f"Score={score}."
-            )
-            confidence = 0.1
-
-        ranked.append({
-            "test": str(tid),
-            "priority": i + 1,
-            "confidence": round(confidence, 2),
-            "reason": reason,
-        })
-
-    return ranked
 
 
 def log_validation_errors(validation: ValidationResult):

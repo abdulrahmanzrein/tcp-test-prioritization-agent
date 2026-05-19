@@ -5,8 +5,8 @@ TCP Agent dispatcher.
 
 The production path is the multi-agent pipeline:
     Filter Agent (cheap LLM, classifies T1-T6)
-    → Ranking Agent (stronger LLM, deeply ranks T1-T5)
-    → Validator (deterministic-fallback safety net)
+    → Ranking Agent (stronger LLM, deeply ranks T1-T5; T6 appended)
+    → Validator (format/completeness check)
 
 The legacy single-agent path was removed in favour of the multi-agent
 pipeline, which is faster, cheaper, and grounded in the Yaraghi 2022
@@ -40,8 +40,8 @@ def run_multi_agent(
     """Two-agent pipeline: Filter → Ranking → Validation.
 
     1. Filter Agent classifies tests into T1-T5 (high-risk) vs T6 (low-signal)
-    2. Ranking Agent performs deep reasoning on only the high-risk subset
-    3. Validator checks output; deterministic fallback on failure
+    2. Ranking Agent performs deep reasoning on the high-risk subset
+    3. Validator checks output and fails loudly on invalid LLM output
 
     filter_gap: seconds to sleep between consecutive Filter Agent LLM calls.
     ranking_workers: number of concurrent Ranking Agent batches (default 1).
@@ -49,7 +49,7 @@ def run_multi_agent(
     from tcp_agent.agent.filter_agent import run_filter_agent
     from tcp_agent.agent.ranking_agent import run_ranking_agent
     from tcp_agent.agent.validator import (
-        validate_ranking, deterministic_fallback, log_validation_errors,
+        validate_ranking, log_validation_errors,
     )
     from tcp_agent.tools.feature_extractor import extract_all_test_ids
 
@@ -82,15 +82,15 @@ def run_multi_agent(
     validation = validate_ranking(ranked, expected_ids, filter_result)
     logger.info(str(validation))
 
-    if validation.is_valid or no_validation:
-        if not validation.is_valid:
-            logger.warning("Bypassing validation failure per --no-validation")
-            log_validation_errors(validation)
+    if validation.is_valid:
         return ranked
 
     log_validation_errors(validation)
-    logger.warning("Falling back to deterministic ranker")
-    return deterministic_fallback(dataset_path)
+    if no_validation:
+        logger.warning("Bypassing validation failure per --no-validation")
+        return ranked
+
+    raise ValueError(f"LLM ranking failed validation:\n{validation}")
 
 
 def run_agent(
