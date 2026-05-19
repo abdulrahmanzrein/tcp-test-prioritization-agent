@@ -1,10 +1,10 @@
 
 from __future__ import annotations
 
+import os
 import time
 import logging
 from typing import Any
-from langchain_core.messages import BaseMessage
 from tcp_agent.utils.token_logger import token_logger
 
 logger = logging.getLogger(__name__)
@@ -17,9 +17,43 @@ def resolve_provider(model_name: str) -> str | None:
         return "anthropic"
     if "mistral" in name:
         return "mistralai"
+    # Alibaba Qwen and local OpenAI-compat tags (e.g. Ollama "qwen2.5:32b") use ChatOpenAI.
+    if "qwen" in name:
+        return "openai"
     if name.startswith("o1") or name.startswith("o3"):
         return "openai"
     return None
+
+
+def openai_compat_base_from_env() -> str:
+    """Base URL for OpenAI-compatible backends (Ollama, vLLM, etc.). Include /v1 suffix."""
+    return (
+        os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE") or ""
+    ).strip()
+
+
+def uses_openai_sdk_stack(model_name: str) -> bool:
+    """True if LangChain routes this model through ChatOpenAI (incl. Qwen via compat API)."""
+    return resolve_provider(model_name) in (None, "openai")
+
+
+def build_init_chat_model_kwargs(model_name: str, *, skip_temperature: bool) -> dict[str, Any]:
+    """Extra kwargs for init_chat_model: temperature + optional OpenAI client base URL / key."""
+    kw: dict[str, Any] = {}
+    if not skip_temperature:
+        kw["temperature"] = 0
+    if not uses_openai_sdk_stack(model_name):
+        return kw
+    base = openai_compat_base_from_env()
+    if base:
+        kw["base_url"] = base.rstrip("/")
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if api_key:
+        kw["api_key"] = api_key
+    elif base:
+        # Ollama and many compat servers ignore the key; SDK still expects a non-empty string.
+        kw["api_key"] = "ollama"
+    return kw
 
 def invoke_with_retry(model: Any, messages: list, model_name: str, max_retries: int = 6):
     """Common retry logic with token usage logging."""

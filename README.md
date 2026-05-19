@@ -21,11 +21,21 @@ Research context: **Yaraghi et al. (TCP-CI)** — comprehensive features and REC
 
 | Models you use | Set |
 |----------------|-----|
-| OpenAI (`gpt-4o`, `gpt-4o-mini`, …) | `OPENAI_API_KEY` |
+| OpenAI (`gpt-5-nano`, `gpt-5-mini`, `gpt-4o`, …) | `OPENAI_API_KEY` |
 | Anthropic (`claude-…`) | `ANTHROPIC_API_KEY` |
 | Google Gemini (`…gemini…`) | `GOOGLE_API_KEY` |
+| **Qwen** (`qwen…` in the model id — Ollama, vLLM, OpenAI-compat) | **`OPENAI_BASE_URL`** pointing at `/v1` (e.g. `http://127.0.0.1:11434/v1` for Ollama). Optionally `OPENAI_API_KEY` (often unused locally). |
 
-`run_llm_agent.py` inspects **`--filter-model`** and **`--ranking-model`** and requires every provider key implied by those names.
+`run_llm_agent.py` inspects **`--filter-model`** and **`--ranking-model`** and requires every provider key implied by those names—except **`OPENAI_API_KEY`** may be omitted when **`OPENAI_BASE_URL`** is set (local compat servers inject a harmless placeholder).
+
+**Example — Qwen on Ollama (same model for filter + ranking):**
+
+```bash
+export OPENAI_BASE_URL=http://127.0.0.1:11434/v1
+python3 scripts/run_llm_agent.py --data datasets/apache@rocketmq.csv \
+  --filter-model qwen2.5:32b --ranking-model qwen2.5:32b
+# or pass --openai-base-url http://127.0.0.1:11434/v1 instead of exporting
+```
 
 ```bash
 python3 -m venv venv
@@ -37,7 +47,7 @@ pip install -r requirements.txt
 
 ## Main entry point: `scripts/run_llm_agent.py`
 
-Rolling **evaluation**: for each of the last **`--eval-window`** builds, the agent sees only **history** (`Build < target`), writes it to a temp CSV, runs **`run_agent`** on that file, then scores the predicted order against the **target** build’s `Verdict` / `Duration` (**APFD**, **APFDc**, **P@10**).
+Rolling **evaluation**: for each of the last **`--eval-window`** builds, the agent sees only **history** (`Build < target`), writes it to a temp CSV, runs **`run_agent`** on that file, then scores the predicted order against the **target** build’s `Verdict` / `Duration` (**APFD**, **APFDc**, **Recall@10**).
 
 ### CLI reference
 
@@ -47,10 +57,11 @@ Rolling **evaluation**: for each of the last **`--eval-window`** builds, the age
 | `--data-dir` *path* | mutually exclusive with `--data` | All `*.csv` in folder |
 | `--mode` | `pilot` | `pilot` = CSV pilot; `production` hooks (see `config.py`) |
 | `--batch-size` | `100` | Tests per **Filter** LLM batch (auto-splits on length errors) |
-| `--filter-model` | `gpt-4o-mini` | Filter LLM id |
-| `--ranking-model` | `gpt-4o` | Ranking LLM id |
+| `--filter-model` | `gpt-5-nano` | Filter LLM id (cheap classifier — OpenAI by default; use `qwen…` + compat URL for local Qwen) |
+| `--ranking-model` | `gemini-3-flash-preview` | Ranking LLM id (tool-calling agent — Google by default; `qwen…` possible if backend supports tools + JSON reliably) |
+| `--openai-base-url` | (unset) | Sets `OPENAI_BASE_URL` for OpenAI-compat servers (Ollama, vLLM, proxies) |
 | `--eval-window` | `5` | Number of most recent builds to average metrics over |
-| `--gap` | `65` | Seconds to sleep between full agent runs per build (`0` disables) |
+| `--gap` | `0` | Seconds to sleep between full agent runs per build. Default 0 because the split-provider combo above has plenty of RPM headroom; raise for lower-tier providers. |
 | `--workers` | `1` | Parallel **datasets** when using `--data-dir` (raises API load) |
 | `--results-csv` | `results/evaluation_summary.csv` | Append metrics; **resume** skips datasets already listed |
 | `--quiet` | off | Less console output for single `--data` runs |
@@ -59,10 +70,10 @@ Rolling **evaluation**: for each of the last **`--eval-window`** builds, the age
 
 ```bash
 # One dataset (prints mean APFD / APFDc / P@10)
-python3 scripts/run_llm_agent.py --data datasets/apache@rocketmq.csv --eval-window 5 --ranking-model gpt-4o
+python3 scripts/run_llm_agent.py --data datasets/apache@rocketmq.csv --eval-window 5
 
 # All CSVs in datasets/ (sequential unless --workers > 1)
-python3 scripts/run_llm_agent.py --data-dir datasets/ --eval-window 5 --ranking-model gpt-4o --quiet
+python3 scripts/run_llm_agent.py --data-dir datasets/ --eval-window 5 --quiet
 
 # Long run with log
 python3 scripts/run_llm_agent.py --data-dir datasets/ --eval-window 5 2>&1 | tee run_output.log
@@ -70,7 +81,7 @@ python3 scripts/run_llm_agent.py --data-dir datasets/ --eval-window 5 2>&1 | tee
 
 ### Results file (`--results-csv`)
 
-Append-only **CSV** columns: `dataset`, `apfd`, `apfdc`, `p_at_10`, `filter_model`, `ranking_model`, `eval_window`, `wall_seconds`, `timestamp`, `status`, `error`. Each completed dataset is one row (`fsync` after write). Rerun the same command to **resume** unfinished batches.
+Append-only **CSV** columns: `dataset`, `apfd`, `apfdc`, `recall_at_10`, `filter_model`, `ranking_model`, `eval_window`, `failed_builds_only`, `wall_seconds`, `timestamp`, `status`, `error`. Each completed dataset is one row (`fsync` after write). Rerun the same command to **resume** unfinished batches.
 
 ---
 
@@ -92,7 +103,7 @@ python3 scripts/run_agent.py --data datasets/Angel-ML@angel.csv
 |--------|--------|
 | **APFD** | Average Percentage of Faults Detected — earlier failures in the ordered list score higher (~0.5 random). |
 | **APFDc** | Cost-cognizant variant using **`Duration`** (see implementation). |
-| **P@10** here | `(# failing tests in the first 10 positions) / 10` — **not** recall; with very few failures, the value is capped (e.g. one failure → max `0.1`). |
+| **Recall@10** | `(# failing tests in the first 10 positions) / (total failing tests in the build)`. 1.0 when every failure was caught in the first 10 ranks. |
 
 Merging LLM output with the target build uses **`build_ranked_df`** (`ranker.py`): **outer** merge so missing tests keep worst priority instead of disappearing.
 

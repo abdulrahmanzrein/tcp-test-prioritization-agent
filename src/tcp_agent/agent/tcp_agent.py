@@ -31,15 +31,20 @@ def run_multi_agent(
     dataset_path,
     mode: AgentMode = AgentMode.PILOT,
     batch_size: int = 200,
-    filter_model: str = "mistral-medium-latest",
-    ranking_model: str = "gpt-4o",
+    filter_model: str = "gpt-5-nano",
+    ranking_model: str = "gemini-3-flash-preview",
     no_validation: bool = False,
+    filter_gap: float = 0.0,
+    ranking_workers: int = 1,
 ):
     """Two-agent pipeline: Filter → Ranking → Validation.
 
     1. Filter Agent classifies tests into T1-T5 (high-risk) vs T6 (low-signal)
     2. Ranking Agent performs deep reasoning on only the high-risk subset
     3. Validator checks output; deterministic fallback on failure
+
+    filter_gap: seconds to sleep between consecutive Filter Agent LLM calls.
+    ranking_workers: number of concurrent Ranking Agent batches (default 1).
     """
     from tcp_agent.agent.filter_agent import run_filter_agent
     from tcp_agent.agent.ranking_agent import run_ranking_agent
@@ -58,6 +63,7 @@ def run_multi_agent(
         dataset_path,
         batch_size=batch_size,
         filter_model=filter_model,
+        inter_batch_sleep=filter_gap,
     )
     logger.info(filter_result.summary())
 
@@ -69,6 +75,7 @@ def run_multi_agent(
         filter_result,
         dataset_path,
         ranking_model=ranking_model,
+        parallelism=ranking_workers,
     )
 
     expected_ids = extract_all_test_ids(dataset_path)
@@ -90,9 +97,11 @@ def run_agent(
     dataset_path,
     mode: AgentMode = AgentMode.PILOT,
     batch_size: int = 200,
-    filter_model: str = "mistral-medium-latest",
-    ranking_model: str = "gpt-4o",
+    filter_model: str = "gpt-5-nano",
+    ranking_model: str = "gemini-3-flash-preview",
     no_validation: bool = False,
+    filter_gap: float = 0.0,
+    ranking_workers: int = 1,
 ):
     """Run the TCP multi-agent pipeline."""
     return run_multi_agent(
@@ -102,4 +111,6 @@ def run_agent(
         filter_model=filter_model,
         ranking_model=ranking_model,
         no_validation=no_validation,
+        filter_gap=filter_gap,
+        ranking_workers=ranking_workers,
     )

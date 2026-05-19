@@ -25,6 +25,8 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from tcp_agent.utils.llm_utils import openai_compat_base_from_env
+
 from tcp_agent.agent.tcp_agent import run_agent
 from tcp_agent.agent.ranker import build_ranked_df, normalize_ranked_items
 from tcp_agent.evaluation import apfd, apfdc, precision_at_k, failure_recall_at_k
@@ -35,8 +37,10 @@ import pandas as pd
 # default settings — can be overridden via CLI
 _mode = AgentMode.PILOT
 _batch_size = 40
-_filter_model = "mistral-medium-latest"
-_ranking_model = "gpt-4o"
+_filter_model = "gpt-5-nano"
+_ranking_model = "gemini-3-flash-preview"
+_filter_gap = 0.0
+_ranking_workers = 1
 
 def _print_diagnosis(
     ranked_df, target_build, build_idx, total_builds, *, failed_builds_only: bool
@@ -47,7 +51,7 @@ def _print_diagnosis(
     m = len(failures)
     build_apfd  = apfd(ranked_df)
     build_apfdc = apfdc(ranked_df)
-    build_p10   = failure_recall_at_k(ranked_df, k=10)
+    build_recall_at_10 = failure_recall_at_k(ranked_df, k=10)
 
     print(f"\n  [Build {target_build}  ({build_idx+1}/{total_builds})  —  {m} failure(s) / {n} tests]")
     if m == 0:
@@ -61,7 +65,10 @@ def _print_diagnosis(
             pct  = rank / n * 100
             flag = "✓" if rank <= 10 else ("✗" if rank > n // 2 else "")
             print(f"    rank {rank:>4} / {n}  ({pct:5.1f}%)  test {int(row['Test'])}  {flag}")
-    print(f"    APFD={build_apfd:.4f}  APFDc={build_apfdc:.4f}  P@10={build_p10:.4f}")
+    print(
+        f"    APFD={build_apfd:.4f}  APFDc={build_apfdc:.4f}  "
+        f"Recall@10={build_recall_at_10:.4f}"
+    )
 
 
 def evaluate(
@@ -103,7 +110,7 @@ def evaluate(
 
     target_builds = eligible[-eval_window:]
 
-    all_apfd, all_apfdc, all_p10 = [], [], []
+    all_apfd, all_apfdc, all_recall_at_10 = [], [], []
 
     for i, target_build in enumerate(target_builds):
         history = df[df["Build"] < target_build]
@@ -125,6 +132,8 @@ def evaluate(
             filter_model=_filter_model,
             ranking_model=_ranking_model,
             no_validation=no_validation,
+            filter_gap=_filter_gap,
+            ranking_workers=_ranking_workers,
         )
 
         if verbose:
@@ -135,7 +144,7 @@ def evaluate(
         ranked_df = build_ranked_df(ranked, target)
         all_apfd.append(apfd(ranked_df))
         all_apfdc.append(apfdc(ranked_df))
-        all_p10.append(failure_recall_at_k(ranked_df, k=10))
+        all_recall_at_10.append(failure_recall_at_k(ranked_df, k=10))
 
         if diagnose:
             _print_diagnosis(
@@ -152,15 +161,15 @@ def evaluate(
 
     n = len(all_apfd)
     return (
-        sum(all_apfd)  / n,
-        sum(all_apfdc) / n,
-        sum(all_p10)   / n,
+        sum(all_apfd)          / n,
+        sum(all_apfdc)         / n,
+        sum(all_recall_at_10)  / n,
         n,
     )
 
 
 def main():
-    global _mode, _batch_size, _filter_model, _ranking_model
+    global _mode, _batch_size, _filter_model, _ranking_model, _filter_gap, _ranking_workers
 
     parser = argparse.ArgumentParser()
     g = parser.add_mutually_exclusive_group(required=True)
@@ -179,12 +188,12 @@ def main():
              "token-limit errors; lower if you see frequent splits.",
     )
     parser.add_argument(
-        "--filter-model", type=str, default="mistral-medium-latest",
-        help="LLM model for the Filter Agent (default: mistral-medium-latest)",
+        "--filter-model", type=str, default="gpt-5-nano",
+        help="LLM model for the Filter Agent (default: gpt-5-nano)",
     )
     parser.add_argument(
-        "--ranking-model", type=str, default="gpt-4o",
-        help="LLM model for the Ranking Agent (default: gpt-4o)",
+        "--ranking-model", type=str, default="gemini-3-flash-preview",
+        help="LLM model for the Ranking Agent (default: gemini-3-flash-preview)",
     )
     parser.add_argument(
         "--eval-window", type=int, default=5,
@@ -193,8 +202,21 @@ def main():
     )
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument(
-        "--gap", type=float, default=65.0,
-        help="Seconds to wait between agent calls to avoid rate limits (0 to disable)",
+        "--gap", type=float, default=0.0,
+        help="Seconds to wait between agent calls to avoid rate limits (0 to disable). "
+             "Defaults to 0 because the default split-provider combo (OpenAI filter + "
+             "Gemini ranking) has high RPM headroom; raise if you switch to lower-tier providers.",
+    )
+    parser.add_argument(
+        "--filter-gap", type=float, default=0.0,
+        help="Seconds to sleep between Filter Agent LLM batches (default: 0). "
+             "Increase on rate-limited providers to space out filter calls within a build.",
+    )
+    parser.add_argument(
+        "--ranking-workers", type=int, default=1,
+        help="Number of concurrent Ranking Agent batches (default: 1, sequential). "
+             "Raise to 4+ on higher-tier API accounts. Multiplies concurrent LLM "
+             "calls — the main source of 429s on rate-limited providers.",
     )
     parser.add_argument(
         "--workers", type=int, default=1,
@@ -229,11 +251,22 @@ def main():
         action="store_true",
         help="After each build, print a breakdown of where each failing test was ranked.",
     )
+    parser.add_argument(
+        "--openai-base-url",
+        type=str,
+        default=None,
+        metavar="URL",
+        help="OpenAI-compatible API base (e.g. Ollama: http://127.0.0.1:11434/v1). Sets OPENAI_BASE_URL for Qwen/OpenAI-compat backends.",
+    )
     args = parser.parse_args()
+    if args.openai_base_url:
+        os.environ["OPENAI_BASE_URL"] = args.openai_base_url.strip()
     _mode = AgentMode.PILOT if args.mode == "pilot" else AgentMode.PRODUCTION
     _batch_size = args.batch_size
     _filter_model = args.filter_model
     _ranking_model = args.ranking_model
+    _filter_gap = args.filter_gap
+    _ranking_workers = args.ranking_workers
 
     needed_keys = set()
     for model_name in [_filter_model, _ranking_model]:
@@ -247,12 +280,18 @@ def main():
         else:
             needed_keys.add("OPENAI_API_KEY")
 
-    missing = [k for k in needed_keys if not os.environ.get(k, "").strip()]
-    if missing:
-        sys.exit(f"Missing required API key(s): {', '.join(missing)}")
+    missing_keys: list[str] = []
+    for k in sorted(needed_keys):
+        if os.environ.get(k, "").strip():
+            continue
+        if k == "OPENAI_API_KEY" and openai_compat_base_from_env():
+            continue
+        missing_keys.append(k)
+    if missing_keys:
+        sys.exit(f"Missing required API key(s): {', '.join(missing_keys)}")
 
     if args.data:
-        a, ac, p10, n_b = evaluate(
+        a, ac, recall_at_10, n_b = evaluate(
             args.data,
             verbose=not args.quiet,
             eval_window=args.eval_window,
@@ -262,7 +301,7 @@ def main():
             diagnose=args.diagnose_failures,
         )
         print(
-            f"APFD={a:.4f}  APFDc={ac:.4f}  P@10={p10:.4f}  "
+            f"APFD={a:.4f}  APFDc={ac:.4f}  Recall@10={recall_at_10:.4f}  "
             f"(avg over {n_b} build(s){'; failed-builds only' if args.failed_builds_only else ''})"
         )
         return
@@ -301,7 +340,7 @@ def _append_result(results_csv: Path, lock: threading.Lock, row: dict):
     """
     results_csv.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
-        "dataset", "apfd", "apfdc", "p_at_10",
+        "dataset", "apfd", "apfdc", "recall_at_10",
         "filter_model", "ranking_model", "eval_window", "failed_builds_only",
         "wall_seconds", "timestamp", "status", "error",
     ]
@@ -321,7 +360,7 @@ def _evaluate_one(f: Path, args, results_csv: Path, lock: threading.Lock) -> tup
     Returns (path, status_string) for the progress log."""
     start = time.time()
     try:
-        a, ac, p10, n_b = evaluate(
+        a, ac, recall_at_10, n_b = evaluate(
             f,
             verbose=False,  # parallel runs — verbose output would interleave
             eval_window=args.eval_window,
@@ -335,7 +374,7 @@ def _evaluate_one(f: Path, args, results_csv: Path, lock: threading.Lock) -> tup
             "dataset": f.name,
             "apfd": f"{a:.6f}",
             "apfdc": f"{ac:.6f}",
-            "p_at_10": f"{p10:.6f}",
+            "recall_at_10": f"{recall_at_10:.6f}",
             "filter_model": _filter_model,
             "ranking_model": _ranking_model,
             "eval_window": args.eval_window,
@@ -346,12 +385,15 @@ def _evaluate_one(f: Path, args, results_csv: Path, lock: threading.Lock) -> tup
             "error": "",
         })
         fbo_note = "fbo" if args.failed_builds_only else "all"
-        return f, f"OK\tAPFD={a:.4f}\tAPFDc={ac:.4f}\tP@10={p10:.4f}\t{n_b}b\t{fbo_note}\t({elapsed:.0f}s)"
+        return f, (
+            f"OK\tAPFD={a:.4f}\tAPFDc={ac:.4f}\t"
+            f"Recall@10={recall_at_10:.4f}\t{n_b}b\t{fbo_note}\t({elapsed:.0f}s)"
+        )
     except Exception as e:
         elapsed = time.time() - start
         _append_result(results_csv, lock, {
             "dataset": f.name,
-            "apfd": "", "apfdc": "", "p_at_10": "",
+            "apfd": "", "apfdc": "", "recall_at_10": "",
             "filter_model": _filter_model,
             "ranking_model": _ranking_model,
             "eval_window": args.eval_window,

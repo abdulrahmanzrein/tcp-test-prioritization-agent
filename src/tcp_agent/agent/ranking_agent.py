@@ -31,7 +31,11 @@ from tcp_agent.tools.complexity_tool import get_test_complexity
 from tcp_agent.tools.covered_code_risk_tool import get_covered_code_risk
 
 
-from tcp_agent.utils.llm_utils import resolve_provider, invoke_with_retry
+from tcp_agent.utils.llm_utils import (
+    resolve_provider,
+    invoke_with_retry,
+    build_init_chat_model_kwargs,
+)
 
 
 # ── Structured output schema ─────────────────────────────────────────
@@ -119,8 +123,9 @@ Bad (too vague): "High failure rate, placing first."
 def _build_models(model_name: str, tools: list):
     """Initialize a chat model and return (tools-bound, structured-output) pair."""
     provider = resolve_provider(model_name)
-    # o-series models (o1, o3) do not support temperature
-    kwargs = {"temperature": 0} if not (model_name.startswith("o1") or model_name.startswith("o3")) else {}
+    # Reasoning-token models (o1, o3, gpt-5*) only accept the default temperature.
+    skip_temp = model_name.startswith(("o1", "o3", "gpt-5"))
+    kwargs = build_init_chat_model_kwargs(model_name, skip_temperature=skip_temp)
     base = init_chat_model(model_name, model_provider=provider, **kwargs)
     return base.bind_tools(tools), base.with_structured_output(PrioritizedTests)
 
@@ -241,7 +246,8 @@ def _rank_batch(
 def run_ranking_agent(
     filter_result: FilterResult,
     dataset_path: str,
-    ranking_model: str = "gpt-4o",
+    ranking_model: str = "gemini-3-flash-preview",
+    parallelism: int = 1,
 ) -> list[dict]:
     """Run the Ranking Agent on the filtered high-risk tests.
 
@@ -249,6 +255,10 @@ def run_ranking_agent(
     Each batch is ranked independently, then results are merged by batch
     order to produce the final ordering. Returns the full ranked list:
     high-risk tests with reasoning + T6 tail.
+
+    parallelism: number of concurrent ranking-batch LLM calls. Default 1
+    (sequential — safe for rate-limited providers). Raise to 4+ on
+    higher-tier API accounts that can handle parallel TPM/RPM.
     """
     high_risk_tests = filter_result.high_risk_tests
     high_risk_ids = [t["test_id"] for t in high_risk_tests]
@@ -266,7 +276,7 @@ def run_ranking_agent(
 
     print(
         f"  [RANKING] {len(high_risk_ids)} high-risk tests → {len(test_batches)} "
-        f"batches of ≤{_RANKING_BATCH_SIZE} (parallelism={_RANKING_PARALLELISM})"
+        f"batches of ≤{_RANKING_BATCH_SIZE} (parallelism={parallelism})"
     )
 
     def _run_one_batch(batch_idx: int, batch_tests, batch_ids):
@@ -287,12 +297,12 @@ def run_ranking_agent(
         return batch_ranked
 
     all_ranked = []
-    if len(test_batches) == 1 or _RANKING_PARALLELISM <= 1:
+    if len(test_batches) == 1 or parallelism <= 1:
         # Avoid thread overhead for the trivial case
         for batch_idx, (batch_tests, batch_ids) in enumerate(zip(test_batches, id_batches)):
             all_ranked.extend(_run_one_batch(batch_idx, batch_tests, batch_ids))
     else:
-        with ThreadPoolExecutor(max_workers=_RANKING_PARALLELISM) as pool:
+        with ThreadPoolExecutor(max_workers=parallelism) as pool:
             futures = {
                 pool.submit(_run_one_batch, idx, bt, bi): idx
                 for idx, (bt, bi) in enumerate(zip(test_batches, id_batches))

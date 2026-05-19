@@ -33,7 +33,11 @@ from tcp_agent.tools.feature_extractor import (
 )
 
 
-from tcp_agent.utils.llm_utils import resolve_provider, invoke_with_retry
+from tcp_agent.utils.llm_utils import (
+    resolve_provider,
+    invoke_with_retry,
+    build_init_chat_model_kwargs,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -205,13 +209,12 @@ T6 — Low-signal remainder
 
 # ── Helper: LLM call with retry ──────────────────────────────────────
 
-# ── Helper: LLM call with retry ──────────────────────────────────────
-
 def _build_structured_model(model_name: str):
     """Initialize a chat model and bind the BatchClassificationResult schema."""
     provider = resolve_provider(model_name)
-    # o-series models (o1, o3) do not support temperature
-    kwargs = {"temperature": 0} if not (model_name.startswith("o1") or model_name.startswith("o3")) else {}
+    # Reasoning-token models (o1, o3, gpt-5*) only accept the default temperature.
+    skip_temp = model_name.startswith(("o1", "o3", "gpt-5"))
+    kwargs = build_init_chat_model_kwargs(model_name, skip_temperature=skip_temp)
     base = init_chat_model(model_name, model_provider=provider, **kwargs)
     return base.with_structured_output(BatchClassificationResult)
 
@@ -293,12 +296,17 @@ def _classify_batch(
 def run_filter_agent(
     dataset_path: str,
     batch_size: int = 40,
-    filter_model: str = "mistral-medium-latest",
+    filter_model: str = "gpt-5-nano",
+    inter_batch_sleep: float = 0.0,
 ) -> FilterResult:
     """Run the Filter Agent over the dataset.
 
     Returns a FilterResult containing high_risk_tests (T1-T5),
     low_signal_tests (T6), and metadata.
+
+    inter_batch_sleep: seconds to sleep between consecutive filter LLM calls
+    (default 0.0 — backward-compatible). Set > 0 to throttle on rate-limited
+    providers.
     """
     risk_profiles = extract_risk_profiles(dataset_path, sparse=True)
     failure_rates = extract_failure_rates(dataset_path)
@@ -312,6 +320,8 @@ def run_filter_agent(
 
     for batch_idx, batch in enumerate(batches):
         parsed = _classify_batch(structured_model, filter_model, batch, failure_rates, exec_times)
+        if inter_batch_sleep > 0 and batch_idx < len(batches) - 1:
+            time.sleep(inter_batch_sleep)
 
         # merge classifications into result
         batch_profiles = {int(p["test"]): p for p in batch}
@@ -406,9 +416,14 @@ def run_filter_agent(
         if current is None or entry["tier"] < current["tier"]:
             deduped[tid] = entry
 
+    # Sort by tier ASC (T1 first) primarily, then by REC_RecentFailRate-derived
+    # test_order as tiebreaker. This guarantees that ranking-agent batches are
+    # tier-coherent: T1 tests always land in earlier batches than T2 tests, etc.
+    # (Previously the keys were swapped, which let a T2 test with high
+    # REC_RecentFailRate outrank a T1 test with low REC_RecentFailRate.)
     merged = sorted(
         deduped.values(),
-        key=lambda e: (test_order.get(e["test_id"], 10**9), e["tier"]),
+        key=lambda e: (e["tier"], test_order.get(e["test_id"], 10**9)),
     )
     result.high_risk_tests = [e for e in merged if e["tier"] <= 5]
     result.low_signal_tests = [e for e in merged if e["tier"] > 5]
