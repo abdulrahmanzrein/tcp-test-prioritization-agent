@@ -36,6 +36,8 @@ def run_multi_agent(
     no_validation: bool = False,
     filter_gap: float = 0.0,
     ranking_workers: int = 1,
+    ranking_batch_size: int | None = None,
+    merge_agent: bool = False,
 ):
     """Two-agent pipeline: Filter → Ranking → Validation.
 
@@ -45,6 +47,8 @@ def run_multi_agent(
 
     filter_gap: seconds to sleep between consecutive Filter Agent LLM calls.
     ranking_workers: number of concurrent Ranking Agent batches (default 1).
+    ranking_batch_size: max high-risk tests per Ranking Agent batch.
+    merge_agent: run a third LLM agent to globally reorder ranking batches.
     """
     from tcp_agent.agent.filter_agent import run_filter_agent
     from tcp_agent.agent.ranking_agent import run_ranking_agent
@@ -76,6 +80,8 @@ def run_multi_agent(
         dataset_path,
         ranking_model=ranking_model,
         parallelism=ranking_workers,
+        batch_size=ranking_batch_size,
+        merge_agent=merge_agent,
     )
 
     expected_ids = extract_all_test_ids(dataset_path)
@@ -102,6 +108,8 @@ def run_agent(
     no_validation: bool = False,
     filter_gap: float = 0.0,
     ranking_workers: int = 1,
+    ranking_batch_size: int | None = None,
+    merge_agent: bool = False,
 ):
     """Run the TCP multi-agent pipeline."""
     return run_multi_agent(
@@ -113,4 +121,6 @@ def run_agent(
         no_validation=no_validation,
         filter_gap=filter_gap,
         ranking_workers=ranking_workers,
+        ranking_batch_size=ranking_batch_size,
+        merge_agent=merge_agent,
     )

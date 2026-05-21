@@ -123,3 +123,80 @@ def extract_all_test_ids(dataset_path: str) -> set:
     df = load_dataset(dataset_path)
     return set(df["Test"].unique().tolist())
 
+
+def candidate_risk_score(profile: dict) -> float:
+    """Cheap deterministic TCP-CI risk score for candidate preselection.
+
+    This is only a retrieval score. The LLM agents still classify/rank the
+    selected candidates. We deliberately use prediction-time legal features and
+    avoid Verdict/Duration from the target build.
+    """
+    def val(name: str, default: float = 0.0) -> float:
+        raw = profile.get(name, default)
+        try:
+            if raw == -1:
+                return default
+            return float(raw)
+        except (TypeError, ValueError):
+            return default
+
+    score = 0.0
+
+    # History dominates in TCP-CI/Yaraghi and is the safest cheap signal.
+    score += 1000.0 * val("REC_RecentFailRate")
+    score += 700.0 * val("REC_TotalFailRate")
+    if val("REC_LastVerdict") != 0:
+        score += 450.0
+
+    last_fail_age = val("REC_LastFailureAge", default=9999.0)
+    if last_fail_age <= 2:
+        score += 260.0
+    elif last_fail_age <= 10:
+        score += 120.0
+
+    score += 90.0 * val("REC_TotalAssertRate")
+    score += 70.0 * val("REC_TotalExcRate")
+    score += 60.0 * val("REC_RecentTransitionRate")
+    score += 40.0 * val("REC_TotalTransitionRate")
+
+    # Coverage/change signals retrieve tests relevant to the current build.
+    score += 160.0 * val("COV_ChnScoreSum")
+    score += 100.0 * val("COV_ImpScoreSum")
+    score += 10.0 * val("COV_ChnCount")
+    score += 5.0 * val("COV_ImpCount")
+
+    # Young, complex, or low-owner-experience tests are useful backstops.
+    age = val("REC_Age", default=9999.0)
+    if age <= 5:
+        score += 80.0
+    elif age <= 20:
+        score += 25.0
+
+    owner_exp = val("TES_PRO_OwnersExperience", default=1.0)
+    if owner_exp <= 0.5:
+        score += 35.0
+    score += min(val("TES_PRO_CommitCount"), 20.0) * 3.0
+    score += min(val("TES_COM_SumCyclomatic"), 250.0) * 0.12
+    score += min(val("TES_COM_CountLineCode"), 2000.0) * 0.01
+
+    # Long-running tests often cover more behavior, but keep this capped so cost
+    # never overwhelms failure evidence.
+    score += min(val("REC_RecentAvgExeTime"), 60000.0) / 2000.0
+    score += min(val("REC_TotalAvgExeTime"), 60000.0) / 3000.0
+
+    return score
+
+
+def select_candidate_test_ids(dataset_path: str, cap: int) -> tuple[list[int], dict[int, float]]:
+    """Return top-K test IDs and their deterministic retrieval scores."""
+    profiles = extract_risk_profiles(dataset_path, sparse=False)
+    scored = []
+    for profile in profiles:
+        tid = int(profile["test"])
+        score = candidate_risk_score(profile)
+        exec_time = float(profile.get("REC_RecentAvgExeTime", profile.get("REC_TotalAvgExeTime", 0.0)) or 0.0)
+        scored.append((score, -exec_time, tid))
+    scored.sort(reverse=True)
+    selected = [tid for _, _, tid in scored[:cap]]
+    score_map = {tid: score for score, _, tid in scored}
+    return selected, score_map

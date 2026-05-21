@@ -11,14 +11,14 @@ the high-risk list to save ranking context.
 Design
 ------
 1. Uses a LangGraph tool-calling loop (same pattern as the original agent)
-   but only requests tool data for the high-risk subset (via test_ids filter).
-2. Produces full 2-3 sentence justifications per test.
-3. Appends the Filter Agent's T6 tail after the ranked high-risk tests.
+   but only requests full feature context for the high-risk subset.
+2. Produces one concise justification per test.
+3. Optionally uses a Merge Agent to globally reorder locally ranked batches.
+4. Appends the Filter Agent's T6 tail after the ranked high-risk tests.
 """
 
 import operator
 import json
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from langchain.chat_models import init_chat_model
@@ -28,9 +28,7 @@ from langgraph.graph import StateGraph, START, END
 from pydantic import BaseModel, Field
 
 from tcp_agent.agent.filter_agent import FilterResult
-from tcp_agent.tools.history_tool import get_test_risk_profile
-from tcp_agent.tools.complexity_tool import get_test_complexity
-from tcp_agent.tools.covered_code_risk_tool import get_covered_code_risk
+from tcp_agent.tools.full_context_tool import get_full_test_context
 
 
 from tcp_agent.utils.llm_utils import (
@@ -46,7 +44,7 @@ class RankedTest(BaseModel):
     test: str = Field(description="Test ID")
     priority: int = Field(description="1 = run first")
     confidence: float = Field(description="0.0–1.0")
-    reason: str = Field(description="2-3 sentence explanation citing tier and feature values")
+    reason: str = Field(description="One short sentence citing tier and key feature values")
 
 
 class PrioritizedTests(BaseModel):
@@ -75,16 +73,18 @@ and cheaply as possible, maximizing APFDc.
 2. **REC features alone achieve near-full-model performance** (CL=0.51 vs Full_M).
 3. **Optimal ordering:** Failed tests first, then by execution time ascending.
 4. **Class imbalance:** Only ~3% of test executions fail (Mendoza et al., 2022).
+5. **Feature set:** Use every provided legal TCP-CI feature; omitted keys are no-data (-1).
 
 ## Ranking Rules (strict priority order)
 
 **T1 — Persistent failures:** REC_TotalFailRate ≥ 0.9. Sort by cost ascending.
 
-**T2 — Recent/active failures:** REC_RecentFailRate > 0 AND REC_LastVerdict = 1.
-Sort by REC_RecentFailRate desc, then cost ascending. Lower REC_LastFailureAge = worse.
+**T2 — Recent/active failures:** REC_RecentFailRate > 0 OR REC_LastVerdict = 1
+OR low REC_LastFailureAge. Sort by REC_RecentFailRate desc, then cost ascending.
+Lower REC_LastFailureAge = worse.
 
-**T3 — Fault-adjacent:** DET_COV_C_Faults > 0 OR DET_COV_IMP_Faults > 0.
-Prefer those also covering recently changed code (COV_ChnScoreSum > 0).
+**T3 — Risky covered changed/impacted code:** COV_ChnScoreSum > 0 OR COV_ImpScoreSum > 0,
+or high COD_COV_* complexity/churn/process values. Prefer changed-code evidence over impacted-code evidence.
 
 **T4 — Historical failures, currently passing:** failure_rate > 0 but
 REC_RecentFailRate = 0. Sort by failure_rate desc, factor in TES_PRO_OwnersExperience.
@@ -94,27 +94,45 @@ low owner experience, or high covered-code complexity. Sort by coverage desc, co
 
 ## Tool Call Strategy
 
-You have access to tools that return detailed features for ONLY the high-risk tests.
-Call get_test_risk_profile first, then get_test_complexity and get_covered_code_risk
-together.  All tools accept test_ids to filter for only the relevant tests.
+You have access to one tool that returns all legal TCP-CI features for ONLY the high-risk tests.
+Call get_full_test_context exactly once with the provided test_ids, then rank from that context.
 
 ## Output (CRITICAL)
 
 Your FINAL message must contain ONLY a JSON array (no markdown, no text before/after).
 Every high-risk test must appear exactly once.
 
-For each **reason**, write EXACTLY ONE concise sentence (max ~35 words) that:
+For each **reason**, write EXACTLY ONE short phrase (max ~10 words) that:
 1. States tier (T1-T5) and why the test belongs there.
-2. Mentions key feature values.
+2. Mentions 1-2 key feature values.
 3. Mentions tie-break logic only if it changed ordering.
 
 Good example:
-"Tier 1: Persistent failure (REC_TotalFailRate=1.0); run early because it is guaranteed to fail and cheap (REC_RecentAvgExeTime=31ms)."
+"T2 recent failure; REC_RecentFailRate=0.8."
 
 Bad (too vague): "High failure rate, placing first."
 
 Use this shape, but replace test values with the exact IDs provided in the task:
 [{\"test\":\"123\",\"priority\":1,\"confidence\":0.9,\"reason\":\"Tier 2: ...\"}]
+"""
+
+
+MERGE_SYSTEM_PROMPT = """\
+You are the global Merge Agent for an LLM-based Test Case Prioritization system.
+
+You receive locally ranked high-risk test batches from the Ranking Agent. Your
+job is to create ONE global ranking across all high-risk tests, maximizing APFDc.
+
+Do NOT preserve batch order if a later-batch test has stronger failure evidence.
+Use the same research-grounded priority: REC/history signals first, then
+test-source TES signals, then coverage/COD_COV signals, with execution cost as
+the tie-breaker when risk is similar.
+
+Return every allowed test exactly once. Do not invent IDs. Do not include T6
+tests. Your final answer must be ONLY a JSON array with:
+test, priority, confidence, reason.
+
+Each reason must be one short phrase, max ~10 words.
 """
 
 
@@ -131,6 +149,14 @@ def _build_models(model_name: str, tools: list):
     kwargs = build_init_chat_model_kwargs(model_name, skip_temperature=skip_temp)
     base = init_chat_model(model_name, model_provider=provider, **kwargs)
     return base.bind_tools(tools), base.with_structured_output(PrioritizedTests)
+
+
+def _build_structured_model(model_name: str):
+    provider = resolve_provider(model_name)
+    skip_temp = model_name.startswith(("o1", "o3", "gpt-5"))
+    kwargs = build_init_chat_model_kwargs(model_name, skip_temperature=skip_temp)
+    base = init_chat_model(model_name, model_provider=provider, **kwargs)
+    return base.with_structured_output(PrioritizedTests)
 
 
 # ── Main ranking function ────────────────────────────────────────────
@@ -288,6 +314,119 @@ def _extract_ranked_tests(
     return ranked
 
 
+def _merge_validation_errors(ranked: list[dict], allowed_ids: list[int]) -> list[str]:
+    return _batch_validation_errors(ranked, allowed_ids)
+
+
+def _repair_merged_ranking(
+    merged: list[dict],
+    original_ranked: list[dict],
+    allowed_ids: list[int],
+) -> list[dict]:
+    """Keep valid merge choices, then restore missing IDs from local ranking order."""
+    allowed_set = set(allowed_ids)
+    by_original_id = {
+        int(item["test"]): item
+        for item in original_ranked
+        if str(item.get("test", "")).isdigit()
+    }
+
+    repaired: list[dict] = []
+    seen: set[int] = set()
+    for item in sorted(merged, key=lambda x: int(x.get("priority", 10**6))):
+        try:
+            tid = int(item["test"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if tid not in allowed_set or tid in seen:
+            continue
+        item["reason"] = item.get("reason") or "Merge order."
+        item["confidence"] = float(item.get("confidence", 0.5))
+        repaired.append(item)
+        seen.add(tid)
+
+    for tid in allowed_ids:
+        if tid in seen:
+            continue
+        fallback = dict(by_original_id.get(tid, {"test": str(tid)}))
+        fallback["test"] = str(tid)
+        fallback["reason"] = fallback.get("reason") or "Merge repair; local order."
+        fallback["confidence"] = min(float(fallback.get("confidence", 0.5)), 0.6)
+        repaired.append(fallback)
+        seen.add(tid)
+
+    for i, item in enumerate(repaired):
+        item["priority"] = i + 1
+    return repaired
+
+
+def _merge_ranked_batches(
+    ranked: list[dict],
+    high_risk_tests: list[dict],
+    ranking_model: str,
+) -> tuple[list[dict], str, int]:
+    """Use a third LLM agent to globally reorder locally ranked batches."""
+    allowed_ids = [int(t["test_id"]) for t in high_risk_tests]
+    if len(ranked) <= 1:
+        return ranked, "not_needed", 0
+
+    by_id = {int(t["test_id"]): t for t in high_risk_tests}
+    merge_items = []
+    for item in ranked:
+        try:
+            tid = int(item["test"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        source = by_id.get(tid, {})
+        merge_items.append({
+            "test": str(tid),
+            "batch": item.get("_batch_idx", 0),
+            "local_priority": item.get("priority"),
+            "tier": source.get("tier"),
+            "key_signals": source.get("key_signals", []),
+            "avg_exec_time": source.get("avg_exec_time", 0.0),
+            "local_reason": item.get("reason", ""),
+            "local_confidence": item.get("confidence", 0.5),
+        })
+
+    structured_model = _build_structured_model(ranking_model)
+    parsed = invoke_with_retry(
+        structured_model,
+        [
+            SystemMessage(content=MERGE_SYSTEM_PROMPT),
+            HumanMessage(content=(
+                f"Allowed high-risk test IDs: {allowed_ids}\n"
+                "Locally ranked batch outputs:\n"
+                f"{json.dumps(merge_items, separators=(',', ':'))}"
+            )),
+        ],
+        model_name=ranking_model,
+    )
+    merged = _coerce_ranked_tests(parsed.ranked_tests)
+    errors = _merge_validation_errors(merged, allowed_ids)
+    if errors:
+        merged_ids = {
+            int(item["test"])
+            for item in merged
+            if str(item.get("test", "")).isdigit()
+        }
+        missing_count = len(set(allowed_ids) - merged_ids)
+        repaired = _repair_merged_ranking(merged, ranked, allowed_ids)
+        repaired_errors = _merge_validation_errors(repaired, allowed_ids)
+        if repaired_errors:
+            raise ValueError(
+                "Merge Agent output invalid and repair failed: "
+                f"{errors[:2]} -> {repaired_errors[:2]}"
+            )
+        print(f"  [MERGE] Merge Agent output repaired: {errors[:2]}")
+        return repaired, "repaired", missing_count
+
+    merged.sort(key=lambda x: int(x.get("priority", 10**6)))
+    for i, item in enumerate(merged):
+        item["priority"] = i + 1
+    return merged, "clean", 0
+
+
 # Max tests per ranking batch.
 # Keep this conservative because long per-test reasons can hit structured-output
 # max_tokens limits (especially on Claude), causing truncated outputs and parse
@@ -312,7 +451,7 @@ def _rank_batch(
 ) -> list[dict]:
     """Rank a single batch of high-risk tests via the LLM tool-calling loop."""
 
-    tools = [get_test_risk_profile, get_test_complexity, get_covered_code_risk]
+    tools = [get_full_test_context]
     tools_by_name = {t.name: t for t in tools}
 
     model_with_tools, structured_model = _build_models(ranking_model, tools)
@@ -390,6 +529,8 @@ def run_ranking_agent(
     dataset_path: str,
     ranking_model: str = "gemini-3-flash-preview",
     parallelism: int = 1,
+    batch_size: int | None = None,
+    merge_agent: bool = False,
 ) -> list[dict]:
     """Run the Ranking Agent on the filtered high-risk tests.
 
@@ -401,24 +542,33 @@ def run_ranking_agent(
     parallelism: number of concurrent ranking-batch LLM calls. Default 1
     (sequential — safe for rate-limited providers). Raise to 4+ on
     higher-tier API accounts that can handle parallel TPM/RPM.
+    batch_size: max high-risk tests per ranking batch. Defaults to
+    _RANKING_BATCH_SIZE.
+    merge_agent: if True, run a third LLM agent to globally reorder locally
+    ranked batches before appending the T6 tail.
     """
     high_risk_tests = filter_result.high_risk_tests
     high_risk_ids = [t["test_id"] for t in high_risk_tests]
 
     # ── Short-circuit: if no high-risk tests, return T6 tail only ────
     if not high_risk_ids:
-        return _build_t6_tail(filter_result.low_signal_tests, start_priority=1)
+        tail = _build_t6_tail(filter_result.low_signal_tests, start_priority=1)
+        for item in tail:
+            item["_merge_status"] = "not_needed"
+            item["_merge_missing_count"] = 0
+        return tail
 
     total_tests = filter_result.metadata.get("total_tests", len(high_risk_ids))
     low_signal_count = filter_result.metadata.get("low_signal_count", 0)
+    effective_batch_size = batch_size or _RANKING_BATCH_SIZE
 
     # ── Batch the high-risk tests ────────────────────────────────────
-    test_batches = _chunk_list(high_risk_tests, _RANKING_BATCH_SIZE)
-    id_batches = _chunk_list(high_risk_ids, _RANKING_BATCH_SIZE)
+    test_batches = _chunk_list(high_risk_tests, effective_batch_size)
+    id_batches = _chunk_list(high_risk_ids, effective_batch_size)
 
     print(
         f"  [RANKING] {len(high_risk_ids)} high-risk tests → {len(test_batches)} "
-        f"batches of ≤{_RANKING_BATCH_SIZE} (parallelism={parallelism})"
+        f"batches of ≤{effective_batch_size} (parallelism={parallelism})"
     )
 
     def _run_one_batch(batch_idx: int, batch_tests, batch_ids):
@@ -439,6 +589,8 @@ def run_ranking_agent(
         return batch_ranked
 
     all_ranked = []
+    merge_status = "disabled" if not merge_agent else "not_needed"
+    merge_missing_count = 0
     if len(test_batches) == 1 or parallelism <= 1:
         # Avoid thread overhead for the trivial case
         for batch_idx, (batch_tests, batch_ids) in enumerate(zip(test_batches, id_batches)):
@@ -459,14 +611,21 @@ def run_ranking_agent(
                     # will be appended at max-priority by build_ranked_df.
                     print(f"  [RANKING] Batch {idx+1} FAILED: {type(e).__name__}: {e}")
 
-    # ── Merge: trust the LLM's structured `priority` field within each batch,
-    #    and preserve batch order across batches.  Earlier batches contain
-    #    higher-failure-rate tests (feature_extractor sorts risk_profiles by
-    #    REC_RecentFailRate desc before chunking), so batch order is meaningful.
+    # ── Merge local batch rankings. If enabled, a third LLM agent resolves the
+    #    global ordering across batches; otherwise preserve batch order.
     def _sort_key(item):
         return (item["_batch_idx"], item.get("priority", 10**6))
 
     all_ranked.sort(key=_sort_key)
+
+    if merge_agent and len(test_batches) > 1 and all_ranked:
+        print(f"  [MERGE] Merging {len(all_ranked)} high-risk tests across {len(test_batches)} batches...")
+        all_ranked, merge_status, merge_missing_count = _merge_ranked_batches(
+            ranked=all_ranked,
+            high_risk_tests=high_risk_tests,
+            ranking_model=ranking_model,
+        )
+
     for item in all_ranked:
         item.pop("_batch_idx", None)
 
@@ -478,6 +637,10 @@ def run_ranking_agent(
     next_priority = len(all_ranked) + 1
     t6_tail = _build_t6_tail(filter_result.low_signal_tests, start_priority=next_priority)
     all_ranked.extend(t6_tail)
+
+    for item in all_ranked:
+        item["_merge_status"] = merge_status
+        item["_merge_missing_count"] = merge_missing_count
 
     return all_ranked
 
@@ -493,11 +656,6 @@ def _build_t6_tail(low_signal_tests: list[dict], start_priority: int) -> list[di
             "test": str(t["test_id"]),
             "priority": start_priority + i,
             "confidence": 0.1,
-            "reason": (
-                f"Tier 6 (Low-signal): No failure history or risk indicators. "
-                f"Sorted by execution cost ({avg_time:.1f}ms). "
-                f"Per Mendoza et al., ~97% of tests never fail — "
-                f"minimizing CI time is optimal for zero-signal tests."
-            ),
+            "reason": f"T6 low-signal; cost={avg_time:.1f}ms.",
         })
     return tail

@@ -293,6 +293,70 @@ def _classify_batch(
         )
 
 
+def _classify_batch_complete(
+    structured_model,
+    model_name: str,
+    batch: list[dict],
+    failure_rates: dict,
+    exec_times: dict,
+    min_chunk: int = 8,
+):
+    """Classify a batch and retry omitted test IDs in smaller chunks.
+
+    Some local OpenAI-compatible models return valid structured output but skip
+    rows when a batch is too large. Treat that like a soft length failure:
+    keep the valid rows, then recursively classify only the omitted profiles.
+    """
+    parsed = _classify_batch(
+        structured_model,
+        model_name,
+        batch,
+        failure_rates,
+        exec_times,
+        min_chunk=min_chunk,
+    )
+
+    expected_ids = {p["test"] for p in batch}
+    seen_ids = {cls.test_id for cls in parsed.classifications}
+    missed = expected_ids - seen_ids
+    if not missed:
+        return parsed
+
+    if len(batch) <= 1:
+        raise ValueError(
+            "Filter LLM omitted test ID after singleton retry: "
+            f"{sorted(int(tid) for tid in missed)}"
+        )
+
+    missed_profiles = [p for p in batch if p["test"] in missed]
+    logger.warning(
+        "Filter LLM omitted %d/%d test(s); retrying omitted IDs in smaller batch(es): %s",
+        len(missed),
+        len(batch),
+        sorted(int(tid) for tid in missed)[:10],
+    )
+
+    if len(missed_profiles) <= min_chunk:
+        retry_chunks = [[p] for p in missed_profiles]
+    else:
+        mid = max(1, len(missed_profiles) // 2)
+        retry_chunks = [missed_profiles[:mid], missed_profiles[mid:]]
+
+    repaired = list(parsed.classifications)
+    for retry_batch in retry_chunks:
+        retry_result = _classify_batch_complete(
+            structured_model,
+            model_name,
+            retry_batch,
+            failure_rates,
+            exec_times,
+            min_chunk=min_chunk,
+        )
+        repaired.extend(retry_result.classifications)
+
+    return BatchClassificationResult(classifications=repaired)
+
+
 def run_filter_agent(
     dataset_path: str,
     batch_size: int = 40,
@@ -319,7 +383,7 @@ def run_filter_agent(
     result = FilterResult()
 
     for batch_idx, batch in enumerate(batches):
-        parsed = _classify_batch(structured_model, filter_model, batch, failure_rates, exec_times)
+        parsed = _classify_batch_complete(structured_model, filter_model, batch, failure_rates, exec_times)
         if inter_batch_sleep > 0 and batch_idx < len(batches) - 1:
             time.sleep(inter_batch_sleep)
 
@@ -342,14 +406,35 @@ def run_filter_agent(
 
         missed = batch_test_ids - classified_ids
         if missed:
-            logger.warning(
-                "Filter LLM omitted %d test(s): %s",
-                len(missed),
-                sorted(int(tid) for tid in missed)[:10],
+            raise ValueError(
+                "Filter LLM omitted "
+                f"{len(missed)} test(s) after retry: "
+                f"{sorted(int(tid) for tid in missed)[:10]}"
             )
 
+    all_expected_ids = {p["test"] for p in risk_profiles}
+    all_classified_ids = {
+        entry["test_id"] for entry in result.high_risk_tests + result.low_signal_tests
+    }
+    missing_after_batches = all_expected_ids - all_classified_ids
+    if missing_after_batches:
+        raise ValueError(
+            "Filter Agent missing "
+            f"{len(missing_after_batches)} test(s) after all retries: "
+            f"{sorted(int(tid) for tid in missing_after_batches)[:10]}"
+        )
+
+    duplicate_count = (
+        len(result.high_risk_tests) + len(result.low_signal_tests) - len(all_classified_ids)
+    )
+    if duplicate_count:
+        logger.warning(
+            "Filter LLM returned %d duplicate classification row(s); keeping first occurrence",
+            duplicate_count,
+        )
+
     # Keep the LLM's classification choices. If structured output duplicates a
-    # test ID, preserve the first LLM row and let validation expose omissions.
+    # test ID, preserve the first LLM row.
     deduped: dict[int, dict] = {}
     for entry in result.high_risk_tests + result.low_signal_tests:
         tid = entry["test_id"]
@@ -359,6 +444,17 @@ def run_filter_agent(
     merged = list(deduped.values())
     result.high_risk_tests = [e for e in merged if e["tier"] <= 5]
     result.low_signal_tests = [e for e in merged if e["tier"] > 5]
+
+    post_dedupe_ids = {
+        entry["test_id"] for entry in result.high_risk_tests + result.low_signal_tests
+    }
+    missing_after_dedupe = all_expected_ids - post_dedupe_ids
+    if missing_after_dedupe:
+        raise ValueError(
+            "Filter Agent missing "
+            f"{len(missing_after_dedupe)} test(s) after duplicate cleanup: "
+            f"{sorted(int(tid) for tid in missing_after_dedupe)[:10]}"
+        )
 
     result.metadata = {
         "total_tests": total_tests,

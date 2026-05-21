@@ -1,164 +1,149 @@
 # TCP Test Prioritization Agent
 
-LLM-driven **test case prioritization (TCP)** for **Continuous Integration**, evaluated on the **TCP-CI** CSV benchmarks (Yaraghi et al., IEEE TSE 2022). The pipeline uses **two LLM stages** plus validation—no training step for the LLM path (a separate **Random Forest** script exists for baseline comparison).
+LLM-driven test case prioritization for CI datasets in the TCP-CI/Yaraghi-style CSV format. The main path is a two-agent LLM pipeline evaluated with rolling historical builds; a separate Random Forest baseline is included for quick local comparison.
 
----
+## Pipeline
 
-## What this repo does
+1. **Filter Agent** (`src/tcp_agent/agent/filter_agent.py`)
+   - Reads the latest historical feature snapshot per test from CSV.
+   - Sends batched structured-output prompts to classify tests as high-risk tiers **T1-T5** or low-signal **T6**.
+   - Uses all legal CSV feature columns except identifiers, labels, outcomes, and leakage columns.
 
-1. **Filter Agent** — Classifies every test into **T1–T5** (high-risk) or **T6** (low-signal) using structured output and batched prompts. Features come from **`feature_extractor`** (pure Python on the CSV), not tool calls.
-2. **Ranking Agent** — For **T1–T5 only**, runs a **LangGraph** tool loop (`get_test_risk_profile`, `get_test_complexity`, `get_covered_code_risk`), then structured extraction of the final ordering. **T6** was already filtered by the LLM and is appended after the high-risk list to save ranking context.
-3. **Validator** — Checks completeness / IDs / duplicates; invalid LLM output fails loudly instead of being replaced by a formula ranker.
+2. **Ranking Agent** (`src/tcp_agent/agent/ranking_agent.py`)
+   - Ranks only T1-T5 tests with a LangGraph tool-calling loop.
+   - Calls one combined context tool that exposes all legal TCP-CI features for the ranking batch.
+   - T6 tests are appended after ranked high-risk tests, ordered by average execution time.
 
-Research context: **Yaraghi et al. (TCP-CI)** — comprehensive features and REC-heavy importance; **Mendoza et al. (PROMISE ’22)** — imbalance and APFDc-focused ML-TCP (your LLM path does not apply SMOTE; the RF baseline does).
+3. **Validator** (`src/tcp_agent/agent/validator.py`)
+   - Checks schema, missing IDs, duplicate IDs, unknown IDs, and priority consistency.
+   - Invalid LLM output raises unless `--no-validation` is passed.
 
----
+The CLI enables a third **Merge Agent** by default. It globally reorders locally ranked high-risk batches before T6 tests are appended, which reduces batch-order artifacts.
 
-## Requirements
-
-- Python 3.10+ (recommended)
-- API keys in **`.env`** at the project root (loaded by `run_llm_agent.py`):
-
-| Models you use | Set |
-|----------------|-----|
-| OpenAI (`gpt-5-nano`, `gpt-5-mini`, `gpt-4o`, …) | `OPENAI_API_KEY` |
-| Anthropic (`claude-…`) | `ANTHROPIC_API_KEY` |
-| Google Gemini (`…gemini…`) | `GOOGLE_API_KEY` |
-| **Qwen** (`qwen…` in the model id — Ollama, vLLM, OpenAI-compat) | **`OPENAI_BASE_URL`** pointing at `/v1` (e.g. `http://127.0.0.1:11434/v1` for Ollama). Optionally `OPENAI_API_KEY` (often unused locally). |
-
-`run_llm_agent.py` inspects **`--filter-model`** and **`--ranking-model`** and requires every provider key implied by those names—except **`OPENAI_API_KEY`** may be omitted when **`OPENAI_BASE_URL`** is set (local compat servers inject a harmless placeholder).
-
-**Example — Qwen on Ollama (same model for filter + ranking):**
-
-```bash
-export OPENAI_BASE_URL=http://127.0.0.1:11434/v1
-python3 scripts/run_llm_agent.py --data datasets/apache@rocketmq.csv \
-  --filter-model qwen2.5:32b --ranking-model qwen2.5:32b
-# or pass --openai-base-url http://127.0.0.1:11434/v1 instead of exporting
-```
+## Setup
 
 ```bash
 python3 -m venv venv
-source venv/bin/activate   # Windows: venv\Scripts\activate
+source venv/bin/activate
 pip install -r requirements.txt
 ```
 
----
+Create `.env` in the repo root with the provider keys you use:
 
-## Main entry point: `scripts/run_llm_agent.py`
+| Model/provider | Required setting |
+| --- | --- |
+| OpenAI-compatible models | `OPENAI_API_KEY` |
+| Google Gemini | `GOOGLE_API_KEY` |
+| Anthropic Claude | `ANTHROPIC_API_KEY` |
+| Mistral | `MISTRAL_API_KEY` |
+| Local/OpenAI-compatible Qwen | `OPENAI_BASE_URL`, usually ending in `/v1`; `OPENAI_API_KEY` is optional |
 
-Rolling **evaluation**: for each of the last **`--eval-window`** builds, the agent sees only **history** (`Build < target`), writes it to a temp CSV, runs **`run_agent`** on that file, then scores the predicted order against the **target** build’s `Verdict` / `Duration` (**APFD**, **APFDc**, **Recall@10**).
-
-### CLI reference
-
-| Argument | Default | Role |
-|----------|---------|------|
-| `--data` *path* | (one required) | Single dataset CSV |
-| `--data-dir` *path* | mutually exclusive with `--data` | All `*.csv` in folder |
-| `--mode` | `pilot` | `pilot` = CSV pilot; `production` hooks (see `config.py`) |
-| `--batch-size` | `100` | Tests per **Filter** LLM batch (auto-splits on length errors) |
-| `--filter-model` | `gpt-5-nano` | Filter LLM id (cheap classifier — OpenAI by default; use `qwen…` + compat URL for local Qwen) |
-| `--ranking-model` | `gemini-3-flash-preview` | Ranking LLM id (tool-calling agent — Google by default; `qwen…` possible if backend supports tools + JSON reliably) |
-| `--openai-base-url` | (unset) | Sets `OPENAI_BASE_URL` for OpenAI-compat servers (Ollama, vLLM, proxies) |
-| `--eval-window` | `5` | Number of most recent builds to average metrics over |
-| `--gap` | `0` | Seconds to sleep between full agent runs per build. Default 0 because the split-provider combo above has plenty of RPM headroom; raise for lower-tier providers. |
-| `--workers` | `1` | Parallel **datasets** when using `--data-dir` (raises API load) |
-| `--results-csv` | `results/evaluation_summary.csv` | Append metrics; **resume** skips datasets already listed |
-| `--quiet` | off | Less console output for single `--data` runs |
-
-### Commands
+Qwen model names containing `qwen` route through the OpenAI-compatible stack. For Ollama or vLLM, set:
 
 ```bash
-# One dataset (prints mean APFD / APFDc / P@10)
-python3 scripts/run_llm_agent.py --data datasets/apache@rocketmq.csv --eval-window 5
-
-# All CSVs in datasets/ (sequential unless --workers > 1)
-python3 scripts/run_llm_agent.py --data-dir datasets/ --eval-window 5 --quiet
-
-# Long run with log
-python3 scripts/run_llm_agent.py --data-dir datasets/ --eval-window 5 2>&1 | tee run_output.log
+export OPENAI_BASE_URL=http://127.0.0.1:11434/v1
 ```
 
-### Results file (`--results-csv`)
+or pass `--openai-base-url`.
 
-Append-only **CSV** columns: `dataset`, `apfd`, `apfdc`, `recall_at_10`, `filter_model`, `ranking_model`, `eval_window`, `failed_builds_only`, `wall_seconds`, `timestamp`, `status`, `error`. Each completed dataset is one row (`fsync` after write). Rerun the same command to **resume** unfinished batches.
+## Main Evaluation Command
 
----
+```bash
+python3 scripts/run_llm_agent.py --data datasets/apache@rocketmq.csv
+```
 
-## ML baseline: `scripts/run_agent.py`
+The evaluator walks over the most recent target builds. For each target build, the agent only sees rows with `Build < target`, then its predicted ordering is scored against the target build.
 
-Trains a **Random Forest** on a random **80/20** split (see `model.py` / `features.py`), ranks the holdout by predicted failure probability, prints **APFD**, **APFDc**, **Precision@10**. **No API key.** Not the same walk-forward protocol as the TCP-CI papers; useful as a quick local baseline.
+Useful examples:
+
+```bash
+# Single dataset, one target build for quick tuning
+python3 scripts/run_llm_agent.py --data datasets/apache@rocketmq.csv --eval-window 1
+
+# All datasets, resumable results CSV
+python3 scripts/run_llm_agent.py --data-dir datasets --quiet
+
+# Local Qwen through an OpenAI-compatible server
+python3 scripts/run_llm_agent.py --data datasets/apache@rocketmq.csv \
+  --openai-base-url http://127.0.0.1:11434/v1 \
+  --filter-model qwen2.5:32b \
+  --ranking-model qwen2.5:32b
+```
+
+## CLI Reference
+
+| Argument | Default | Meaning |
+| --- | --- | --- |
+| `--data` | required unless `--data-dir` | Evaluate one CSV |
+| `--data-dir` | required unless `--data` | Evaluate every `*.csv` in a directory |
+| `--mode` | `pilot` | `pilot` reads CSV features; `production` hooks are placeholders |
+| `--batch-size` | `40` | Filter Agent tests per LLM batch; auto-splits on length errors |
+| `--filter-model` | `gpt-5-nano` | Model used for T1-T6 filtering |
+| `--ranking-model` | `gemini-3-flash-preview` | Model used for high-risk ranking |
+| `--eval-window` | `5` | Number of most recent eligible target builds |
+| `--failed-builds-only` | on | Evaluate only target builds with at least one failure |
+| `--all-builds` | off | Include zero-failure target builds |
+| `--gap` | `0` | Sleep between full agent runs for target builds |
+| `--filter-gap` | `0` | Sleep between Filter Agent batches |
+| `--ranking-workers` | `1` | Concurrent Ranking Agent batches |
+| `--ranking-batch-size` | `8` | High-risk tests per Ranking Agent batch |
+| `--no-merge-agent` | off | Disable global Merge Agent |
+| `--workers` | `1` | Concurrent datasets for `--data-dir` |
+| `--results-csv` | `results/evaluation_summary.csv` | Resumable append-only results file |
+| `--no-validation` | off | Return invalid LLM rankings instead of raising |
+| `--diagnose-failures` | off | Print where failing tests landed per build |
+| `--openai-base-url` | unset | OpenAI-compatible base URL for local/proxy models |
+
+Results CSV columns include metrics, model names, batch settings, wall time, timestamp, status, and error. Completed rows are skipped only when the dataset and experiment settings match.
+
+## Current Internals
+
+- Filter batches default to **40** tests.
+- Ranking batches default to **8** tests and can be changed with `--ranking-batch-size`.
+- The Merge Agent is enabled by default in the CLI and can be disabled with `--no-merge-agent`.
+- Ranking parallelism is controlled by `--ranking-workers`; the module constant `_RANKING_PARALLELISM` is not used by the CLI path.
+- CSV parsing is cached by `src/tcp_agent/data_cache.py`, but each target build still writes a temporary history CSV.
+- Provider routing lives in `src/tcp_agent/utils/llm_utils.py`.
+- Token usage is logged to `logs/token_usage.log`.
+
+## Metrics
+
+- **APFD:** rewards finding failing tests earlier.
+- **APFDc:** APFD variant weighted by `Duration`.
+- **Recall@10:** fraction of all failing tests found in the top 10.
+
+`build_ranked_df` uses an outer merge so tests missed by the LLM remain in the evaluation and receive worst priority rather than disappearing.
+
+## Random Forest Baseline
 
 ```bash
 python3 scripts/run_agent.py --data datasets/Angel-ML@angel.csv
 ```
 
-(`sys.path` is adjusted so this works without `PYTHONPATH`.)
+This baseline trains a Random Forest with an 80/20 random split, applies SMOTE to the training fold, ranks the holdout by predicted failure probability, and prints APFD, APFDc, and Precision@10. It is not the same rolling evaluation protocol as the LLM path.
 
----
+## Repository Map
 
-## Metrics (`src/tcp_agent/evaluation.py`)
-
-| Symbol | Meaning |
-|--------|--------|
-| **APFD** | Average Percentage of Faults Detected — earlier failures in the ordered list score higher (~0.5 random). |
-| **APFDc** | Cost-cognizant variant using **`Duration`** (see implementation). |
-| **Recall@10** | `(# failing tests in the first 10 positions) / (total failing tests in the build)`. 1.0 when every failure was caught in the first 10 ranks. |
-
-Merging LLM output with the target build uses **`build_ranked_df`** (`ranker.py`): **outer** merge so missing tests keep worst priority instead of disappearing.
-
----
-
-## Ranking internals (summary)
-
-- High-risk tests are processed in batches of **`_RANKING_BATCH_SIZE`** (15). Up to **`_RANKING_PARALLELISM`** batches (4) may run in **threads**—increase only if your API tier supports the extra TPM/RPM.
-- **Models** are created with LangChain **`init_chat_model`**; names starting with `claude` use Anthropic, names containing `gemini` use Google, otherwise OpenAI.
-
----
-
-## Repository layout
-
-```
-tcp-test-prioritization-agent/
-├── scripts/
-│   ├── run_llm_agent.py      # Evaluation + batch runs + CLI
-│   └── run_agent.py          # RF baseline (local, --data required)
-├── datasets/                 # TCP-CI-style CSVs (25 subjects in this project)
-├── results/                  # Default output for --results-csv
-├── requirements.txt
-├── .env                      # API keys (not committed)
-└── src/tcp_agent/
-    ├── agent/
-    │   ├── tcp_agent.py      # run_agent → Filter → Ranking → validate
-    │   ├── filter_agent.py   # T1–T6 classification
-    │   ├── ranking_agent.py  # LangGraph ranking for T1–T5
-    │   ├── validator.py      # Output checks; no ranking fallback
-    │   └── ranker.py         # normalize_ranked_items, build_ranked_df
-    ├── tools/
-    │   ├── feature_extractor.py   # CSV features for Filter (no LLM tools)
-    │   ├── history_tool.py        # get_test_risk_profile (Ranking)
-    │   ├── complexity_tool.py     # get_test_complexity
-    │   └── covered_code_risk_tool.py
-    ├── data_cache.py         # Thread-safe in-memory CSV parse cache
-    ├── data_loader.py        # RF baseline loading
-    ├── evaluation.py         # APFD, APFDc, precision_at_k
-    ├── config.py             # AgentMode PILOT / PRODUCTION
-    └── features.py, model.py, ranking.py   # RF baseline pipeline
+```text
+scripts/run_llm_agent.py          Rolling LLM evaluation CLI
+scripts/run_agent.py              Random Forest baseline CLI
+src/tcp_agent/agent/filter_agent.py
+src/tcp_agent/agent/ranking_agent.py
+src/tcp_agent/agent/validator.py
+src/tcp_agent/agent/ranker.py
+src/tcp_agent/tools/              LangChain tools and CSV feature extraction
+src/tcp_agent/evaluation.py       APFD, APFDc, Precision@K, Recall@K
+src/tcp_agent/data_cache.py       Thread-safe pandas CSV cache
+tests/                            Regression tests for batching, validation, Qwen routing, results CSV
 ```
 
-Tier **definitions** for the Filter live in **`FILTER_SYSTEM_PROMPT`** inside `filter_agent.py`; ranking rules and tool instructions live in **`RANKING_SYSTEM_PROMPT`** in `ranking_agent.py`.
+## Notes
 
----
-
-## Practical notes
-
-- **Rate limits:** Use **`--gap`** (and keep **`--workers 1`**) when you see `[filter-RETRY]` / `[ranking-RETRY]` or HTTP 429s. Ranking parallelism multiplies concurrent LLM traffic.
-- **Variance:** LLM outputs can vary run-to-run even at `temperature=0`.
-- **Data source:** CSVs follow the TCP-CI feature schema described in Yaraghi et al.; column presence can vary slightly by subject—tools and extractor guard missing columns where needed.
-
----
+- LLM output can vary even with `temperature=0`.
+- `DET_COV_C_Faults` and `DET_COV_IMP_Faults` are excluded from the LLM feature set because they leak post-run fault information.
+- Use `--gap`, `--filter-gap`, lower `--workers`, or lower `--ranking-workers` when providers return 429/rate-limit errors.
 
 ## References
 
-- A. S. Yaraghi *et al.*, “Scalable and Accurate Test Case Prioritization in Continuous Integration Contexts,” *IEEE TSE*, 2022. (arXiv:2109.13168.)
-- J. Mendoza *et al.*, “On the Effectiveness of Data Balancing Techniques in the Context of ML-Based Test Case Prioritization,” PROMISE ’22. (ACM: 3558489.3559073.)
+- A. S. Yaraghi et al., “Scalable and Accurate Test Case Prioritization in Continuous Integration Contexts,” IEEE TSE, 2022.
+- J. Mendoza et al., “On the Effectiveness of Data Balancing Techniques in the Context of ML-Based Test Case Prioritization,” PROMISE 2022.
