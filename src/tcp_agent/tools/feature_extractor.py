@@ -11,31 +11,23 @@ Used by the Filter Agent to pre-load features before sending them to the
 LLM in batches.
 """
 
-import pandas as pd
 from typing import Optional
 
 from tcp_agent.data_cache import load_dataset
 
 
-# ── Feature column selection (Yaraghi et al. 2022 — full 148-feature set) ─
+# ── Feature column selection (Yaraghi et al. 2022 — full 150-feature set) ─
 
 # Columns that are NOT features: identifiers, labels, and execution outcomes.
 _NON_FEATURE_COLS = {"Build", "Test", "Verdict", "Duration"}
 
-# Illegal features (data leakage). DET_COV_*Faults count faults DETECTED by the
-# test in the build being evaluated — only knowable AFTER the test has run, so
-# using them at prediction time leaks the label. Yaraghi 2022 § 3.2.5 defines
-# them; their RF model uses them only because PDF (Previously Detected Faults)
-# is recomputed from prior builds, not the target build. In our pipeline we
-# evaluate on the target build's verdicts, so we must exclude these two.
-_ILLEGAL_FEATURE_COLS = {"DET_COV_C_Faults", "DET_COV_IMP_Faults"}
-
 
 def _legal_feature_cols(df_columns) -> list[str]:
-    """All legal feature columns in the dataset (148 in TCP-CI, fewer if a
-    subject's CSV is missing some). Excludes identifiers, labels, and the
-    two leakage features."""
-    excluded = _NON_FEATURE_COLS | _ILLEGAL_FEATURE_COLS
+    """All legal feature columns in the dataset (150 in TCP-CI, fewer if a
+    subject's CSV is missing some). Excludes identifiers, labels, and execution
+    outcomes. DET_COV_*_Faults are retained as historical previously-detected-
+    fault features from the Yaraghi feature model."""
+    excluded = _NON_FEATURE_COLS
     return [c for c in df_columns if c not in excluded]
 
 
@@ -44,11 +36,11 @@ def extract_risk_profiles(
     sparse: bool = True,
     test_ids: Optional[list[int]] = None,
 ) -> list[dict]:
-    """Extract the full Yaraghi 2022 feature set per test (148 features when the
+    """Extract the full Yaraghi 2022 feature set per test (150 features when the
     CSV has all of them, fewer if a subject's dataset is missing some columns).
 
-    The two illegal columns (DET_COV_C_Faults, DET_COV_IMP_Faults) are excluded
-    to prevent label leakage — see _legal_feature_cols above.
+    DET_COV_C_Faults and DET_COV_IMP_Faults are included as historical
+    previously-detected-fault features defined in the TCP-CI feature model.
 
     Parameters
     ----------
@@ -103,6 +95,8 @@ def extract_risk_profiles(
 def extract_failure_rates(dataset_path: str) -> dict:
     """Return {test_id: failure_rate} mapping for every test."""
     df = load_dataset(dataset_path)
+    if "Verdict" not in df.columns:
+        return {}
     rates = (
         df.assign(_fail=df["Verdict"].ne(0))
         .groupby("Test")["_fail"]
@@ -112,10 +106,26 @@ def extract_failure_rates(dataset_path: str) -> dict:
 
 
 def extract_exec_times(dataset_path: str) -> dict:
-    """Return {test_id: avg_exec_time} mapping for every test."""
+    """Return {test_id: avg_exec_time} mapping for every test.
+
+    If target Duration is hidden from the LLM input, fall back to historical REC
+    execution-time features already present in the target feature rows.
+    """
     df = load_dataset(dataset_path)
-    times = df.groupby("Test")["Duration"].mean()
-    return times.to_dict()
+    if "Duration" in df.columns:
+        times = df.groupby("Test")["Duration"].mean()
+        return times.to_dict()
+
+    latest = (
+        df.sort_values("Build", ascending=False)
+        .groupby("Test")
+        .first()
+        .reset_index()
+    )
+    for col in ("REC_RecentAvgExeTime", "REC_TotalAvgExeTime", "REC_LastExeTime"):
+        if col in latest.columns:
+            return latest.set_index("Test")[col].fillna(0.0).to_dict()
+    return {int(tid): 0.0 for tid in df["Test"].unique().tolist()}
 
 
 def extract_all_test_ids(dataset_path: str) -> set:

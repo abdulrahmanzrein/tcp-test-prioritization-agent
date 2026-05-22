@@ -1,0 +1,52 @@
+{\rtf1\ansi\deff0
+{\fonttbl{\f0 Arial;}}
+\fs24
+\b LLM TCP Replication: Current Issues and Evidence Plan\b0\par
+\par
+\b Goal\b0\par
+This project is intended to replicate the TCP-CI/Yaraghi evaluation setting while replacing the original RF/RankLib ranking model with a multi-agent LLM pipeline. The closest replication-style run uses the latest 50 failed builds, the 150-feature TCP-CI feature set, no candidate cap, hidden target Verdict and Duration, and APFD/APFDc evaluation after ranking.\par
+\par
+\b Main Current Issue: Runtime Without Candidate Cap\b0\par
+The biggest practical issue is speed. With candidate cap disabled, every target build sends the full target test suite through the LLM pipeline. The paper's RF ranking model can score a build quickly after training, but the LLM approach requires multiple model calls per build.\par
+\par
+For each target build, the current LLM pipeline may perform:\par
+1. Filter Agent calls over batches of all target-build tests.\par
+2. Ranking Agent calls over batches of high-risk tests.\par
+3. Optional Merge Agent call to globally reorder high-risk ranking batches.\par
+\par
+This means the cost grows with the number of target builds, number of tests per build, filter batch size, ranking batch size, and merge-agent usage. A full 25-dataset, 50-failed-build, no-cap run can be very slow on a local model such as qwen2.5:32b.\par
+\par
+\b What Is Now More Paper-Aligned\b0\par
+The runner now gives the LLM target-build feature rows, with Verdict and Duration removed. This matches the paper's prediction setup more closely: rank tests for the target build using target-build features, then evaluate later using target Verdict and Duration. DET_COV_C_Faults and DET_COV_IMP_Faults are included as historical previously-detected-fault features from the 150-feature TCP-CI setting.\par
+\par
+\b What Still Differs From The Paper\b0\par
+The paper trains RF/RankLib models on prior failed builds. This project replaces that learned model with a multi-agent LLM process. The Filter Agent's T1-T6 split and deterministic T6 tail are part of the LLM method, not part of the original RF method. Therefore the correct claim is replication of the TCP-CI feature/evaluation setting with an LLM ranking-method substitution, not exact method replication.\par
+\par
+\b Evidence CSV For Professor\b0\par
+The runner now supports --llm-trace-csv. For a one-build run, this CSV appends one row per test. Each row records:\par
+- Dataset and target build.\par
+- Sanitized feature JSON shown to the LLM.\par
+- Flags proving Verdict and Duration were not shown to the LLM.\par
+- Final LLM priority, confidence, and reason.\par
+- Actual Verdict and Duration used only for evaluation.\par
+- APFD, APFDc, Recall@10, and build wall time.\par
+\par
+\b Suggested One-Build Evidence Command\b0\par
+python3 scripts/run_llm_agent.py \\\par
+  --data datasets/apache@rocketmq.csv \\\par
+  --results-csv results/professor_one_build_summary.csv \\\par
+  --llm-trace-csv results/professor_one_build_trace.csv \\\par
+  --filter-model qwen2.5:32b \\\par
+  --ranking-model qwen2.5:32b \\\par
+  --openai-base-url http://127.0.0.1:11434/v1 \\\par
+  --eval-window 1 \\\par
+  --history-failed-builds-only \\\par
+  --candidate-cap 0 \\\par
+  --batch-size 10 \\\par
+  --ranking-batch-size 12 \\\par
+  --ranking-workers 2 \\\par
+  --quiet\par
+\par
+\b Recommendation\b0\par
+Use the no-cap one-build trace as evidence of correctness and transparency. For full evaluation, expect significant runtime. If runtime is too high, candidate-cap experiments can still be reported, but they should be described as capped LLM experiments rather than exact paper-style full-suite runs.\par
+}

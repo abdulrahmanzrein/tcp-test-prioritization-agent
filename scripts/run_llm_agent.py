@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import sys
 import threading
@@ -29,7 +30,7 @@ from tcp_agent.utils.llm_utils import openai_compat_base_from_env
 
 from tcp_agent.agent.tcp_agent import run_agent
 from tcp_agent.agent.ranker import build_ranked_df, normalize_ranked_items
-from tcp_agent.evaluation import apfd, apfdc, precision_at_k, failure_recall_at_k
+from tcp_agent.evaluation import apfd, apfdc, failure_recall_at_k
 from tcp_agent.config import AgentMode
 from tcp_agent.data_cache import load_dataset
 from tcp_agent.tools.feature_extractor import candidate_risk_score
@@ -96,9 +97,23 @@ def _extract_merge_missing_count(ranked: list[dict]) -> int:
     return 0
 
 
-def _history_profile_score_map(history) -> tuple[set[int], dict[int, float], dict[int, float]]:
+_FORBIDDEN_AGENT_COLS = {"Verdict", "Duration"}
+
+
+def _build_agent_feature_frame(target):
+    """Target-build feature rows that are safe to show to the LLM.
+
+    This matches the paper's prediction setup: rank tests in the target build
+    from that build's feature vector, while hiding outcome/cost columns used
+    later for APFD/APFDc evaluation.
+    """
+    drop_cols = [c for c in _FORBIDDEN_AGENT_COLS if c in target.columns]
+    return target.drop(columns=drop_cols).copy()
+
+
+def _feature_profile_score_map(features) -> tuple[set[int], dict[int, float], dict[int, float]]:
     latest = (
-        history.sort_values("Build", ascending=False)
+        features.sort_values("Build", ascending=False)
         .groupby("Test")
         .first()
         .reset_index()
@@ -115,11 +130,11 @@ def _history_profile_score_map(history) -> tuple[set[int], dict[int, float], dic
     return set(score_map), score_map, exec_map
 
 
-def _apply_candidate_cap(history, target, cap: int | None):
-    """Return capped history and cap metadata for one target build."""
+def _apply_candidate_cap(agent_features, target, cap: int | None):
+    """Return capped target feature rows and cap metadata for one target build."""
     if cap is None or cap <= 0:
-        all_ids, score_map, exec_map = _history_profile_score_map(history)
-        return history, {
+        all_ids, score_map, exec_map = _feature_profile_score_map(agent_features)
+        return agent_features, {
             "enabled": False,
             "cap": "",
             "selected_ids": sorted(all_ids),
@@ -131,14 +146,14 @@ def _apply_candidate_cap(history, target, cap: int | None):
             "tail_count": 0,
         }
 
-    all_ids, score_map, exec_map = _history_profile_score_map(history)
+    all_ids, score_map, exec_map = _feature_profile_score_map(agent_features)
     selected = sorted(
         all_ids,
         key=lambda tid: (score_map.get(tid, 0.0), -exec_map.get(tid, 0.0), tid),
         reverse=True,
     )[:cap]
     selected_set = set(selected)
-    capped_history = history[history["Test"].isin(selected_set)]
+    capped_features = agent_features[agent_features["Test"].isin(selected_set)]
 
     target_ids = {int(tid) for tid in target["Test"].unique().tolist()}
     target_fail_ids = {int(tid) for tid in target.loc[target["Verdict"] != 0, "Test"].unique().tolist()}
@@ -148,7 +163,7 @@ def _apply_candidate_cap(history, target, cap: int | None):
         target_ids - selected_set,
         key=lambda tid: (-score_map.get(tid, 0.0), exec_map.get(tid, 0.0), tid),
     )
-    return capped_history, {
+    return capped_features, {
         "enabled": True,
         "cap": cap,
         "selected_ids": selected,
@@ -159,6 +174,12 @@ def _apply_candidate_cap(history, target, cap: int | None):
         "selected_count": len(selected),
         "tail_count": len(tail_ids),
     }
+
+
+def _filter_history_to_failed_builds(history):
+    """Keep only historical builds that had at least one failing test."""
+    failed_history_builds = history.loc[history["Verdict"] != 0, "Build"].unique()
+    return history[history["Build"].isin(failed_history_builds)]
 
 
 def _append_candidate_tail(ranked: list[dict], cap_meta: dict) -> list[dict]:
@@ -197,9 +218,12 @@ def evaluate(
     gap=65.0,
     no_validation=False,
     failed_builds_only=False,
+    history_failed_builds_only=False,
     diagnose=False,
     build_results_csv: Path | None = None,
     build_results_lock: threading.Lock | None = None,
+    llm_trace_csv: Path | None = None,
+    llm_trace_lock: threading.Lock | None = None,
 ):
     """
     Rolling-window evaluation over the last `eval_window` builds.
@@ -209,8 +233,13 @@ def evaluate(
     and would inflate APFD/APFDc to 1.0.
 
     For each target build B:
-      - history = all builds BEFORE B  (what the agent can see)
-      - target  = build B              (what we score against)
+      - history = all builds BEFORE B  (used to ensure prior data exists)
+      - agent input = build B feature rows without Verdict/Duration
+      - target = build B with Verdict/Duration for scoring after ranking
+
+    When history_failed_builds_only=True, the prior-data availability check is
+    restricted to historical builds that had at least one failing test. The LLM
+    still receives only sanitized target-build feature rows.
     """
     df = load_dataset(csv_path)
     min_build = df["Build"].min()
@@ -241,19 +270,22 @@ def evaluate(
         tmp_path = None
         history = df[df["Build"] < target_build]
         target  = df[df["Build"] == target_build]
+        if history_failed_builds_only:
+            history = _filter_history_to_failed_builds(history)
 
         if history.empty:
             continue
 
         try:
-            agent_history, cap_meta = _apply_candidate_cap(history, target, _candidate_cap)
+            agent_features = _build_agent_feature_frame(target)
+            agent_input, cap_meta = _apply_candidate_cap(agent_features, target, _candidate_cap)
             if cap_meta.get("enabled") and cap_meta.get("recall") != "":
                 cap_recalls.append(float(cap_meta["recall"]))
 
             with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".csv", delete=False, prefix="tcp_history_"
+                mode="w", suffix=".csv", delete=False, prefix="tcp_target_features_"
             ) as tmp:
-                agent_history.to_csv(tmp, index=False)
+                agent_input.to_csv(tmp, index=False)
                 tmp_path = tmp.name
 
             ranked = run_agent(
@@ -283,9 +315,26 @@ def evaluate(
             build_apfd = apfd(ranked_df)
             build_apfdc = apfdc(ranked_df)
             build_recall_at_10 = failure_recall_at_k(ranked_df, k=10)
+            build_wall_seconds = time.time() - build_start
             all_apfd.append(build_apfd)
             all_apfdc.append(build_apfdc)
             all_recall_at_10.append(build_recall_at_10)
+
+            if llm_trace_csv:
+                _append_llm_trace(
+                    llm_trace_csv,
+                    llm_trace_lock or build_results_lock or threading.Lock(),
+                    dataset=Path(csv_path).name,
+                    target_build=target_build,
+                    agent_input=agent_input,
+                    ranked=ranked,
+                    target=target,
+                    build_apfd=build_apfd,
+                    build_apfdc=build_apfdc,
+                    build_recall_at_10=build_recall_at_10,
+                    build_wall_seconds=build_wall_seconds,
+                    cap_meta=cap_meta,
+                )
 
             if build_results_csv:
                 _append_build_result(
@@ -305,6 +354,7 @@ def evaluate(
                         "ranking_model": _ranking_model,
                         "eval_window": eval_window,
                         "failed_builds_only": "1" if failed_builds_only else "0",
+                        "history_failed_builds_only": "1" if history_failed_builds_only else "0",
                         "batch_size": _batch_size,
                         "ranking_batch_size": _ranking_batch_size,
                         "ranking_workers": _ranking_workers,
@@ -319,7 +369,7 @@ def evaluate(
                             if isinstance(cap_meta.get("recall"), float)
                             else cap_meta.get("recall", "")
                         ),
-                        "wall_seconds": f"{time.time() - build_start:.1f}",
+                        "wall_seconds": f"{build_wall_seconds:.1f}",
                         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
                         "status": "ok",
                         "error": "",
@@ -350,6 +400,7 @@ def evaluate(
                         "ranking_model": _ranking_model,
                         "eval_window": eval_window,
                         "failed_builds_only": "1" if failed_builds_only else "0",
+                        "history_failed_builds_only": "1" if history_failed_builds_only else "0",
                         "batch_size": _batch_size,
                         "ranking_batch_size": _ranking_batch_size,
                         "ranking_workers": _ranking_workers,
@@ -418,7 +469,7 @@ def main():
     parser.add_argument(
         "--batch-size", type=int, default=40,
         help="Number of tests per Filter Agent batch (default: 40, sized for "
-             "the full 148-feature Yaraghi 2022 set). Auto-splits on output-"
+             "the full 150-feature Yaraghi 2022 set). Auto-splits on output-"
              "token-limit errors; lower if you see frequent splits.",
     )
     parser.add_argument(
@@ -432,7 +483,8 @@ def main():
     parser.add_argument(
         "--eval-window", type=int, default=5,
         help="Number of most-recent builds to evaluate against (default: 5). "
-             "The agent is called once per build with all prior builds as history.",
+             "The agent is called once per target build with sanitized "
+             "target-build feature rows.",
     )
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument(
@@ -487,6 +539,12 @@ def main():
         help="Path to per-build detailed results CSV. Defaults to <results-csv stem>_builds.csv.",
     )
     parser.add_argument(
+        "--llm-trace-csv",
+        type=Path,
+        default=None,
+        help="Optional per-test trace CSV showing sanitized LLM input features, final LLM ranking output, true evaluation labels, and build wall time.",
+    )
+    parser.add_argument(
         "--no-validation", action="store_true",
         help="Bypass the validation layer (use LLM output even if invalid)",
     )
@@ -503,6 +561,13 @@ def main():
         dest="failed_builds_only",
         action="store_false",
         help="Evaluate on every eligible build, including those with no failing tests.",
+    )
+    parser.add_argument(
+        "--history-failed-builds-only",
+        action="store_true",
+        help="Restrict the prior-data availability check to historical builds "
+             "that had at least one failing test. Target selection is unchanged; "
+             "the LLM still receives sanitized target-build feature rows.",
     )
     parser.add_argument(
         "--diagnose-failures",
@@ -568,9 +633,12 @@ def main():
                 gap=args.gap,
                 no_validation=args.no_validation,
                 failed_builds_only=args.failed_builds_only,
+                history_failed_builds_only=args.history_failed_builds_only,
                 diagnose=args.diagnose_failures,
                 build_results_csv=args.build_results_csv,
                 build_results_lock=build_lock,
+                llm_trace_csv=args.llm_trace_csv,
+                llm_trace_lock=build_lock,
             )
         except Exception as e:
             elapsed = time.time() - start
@@ -581,6 +649,7 @@ def main():
                 "ranking_model": _ranking_model,
                 "eval_window": args.eval_window,
                 "failed_builds_only": "1" if args.failed_builds_only else "0",
+                "history_failed_builds_only": "1" if args.history_failed_builds_only else "0",
                 "batch_size": _batch_size,
                 "ranking_batch_size": _ranking_batch_size,
                 "ranking_workers": _ranking_workers,
@@ -602,6 +671,8 @@ def main():
             })
             print(f"Failed result appended to {args.results_csv}")
             print(f"Per-build results appended to {args.build_results_csv}")
+            if args.llm_trace_csv:
+                print(f"LLM trace rows appended to {args.llm_trace_csv}")
             raise
         else:
             elapsed = time.time() - start
@@ -614,6 +685,7 @@ def main():
                 "ranking_model": _ranking_model,
                 "eval_window": args.eval_window,
                 "failed_builds_only": "1" if args.failed_builds_only else "0",
+                "history_failed_builds_only": "1" if args.history_failed_builds_only else "0",
                 "batch_size": _batch_size,
                 "ranking_batch_size": _ranking_batch_size,
                 "ranking_workers": _ranking_workers,
@@ -643,10 +715,14 @@ def main():
             })
         print(
             f"APFD={a:.4f}  APFDc={ac:.4f}  Recall@10={recall_at_10:.4f}  "
-            f"(avg over {n_b} build(s){'; failed-builds only' if args.failed_builds_only else ''})"
+            f"(avg over {n_b} build(s)"
+            f"{'; failed-builds only' if args.failed_builds_only else ''}"
+            f"{'; failed-history only' if args.history_failed_builds_only else ''})"
         )
         print(f"Result appended to {args.results_csv}")
         print(f"Per-build results appended to {args.build_results_csv}")
+        if args.llm_trace_csv:
+            print(f"LLM trace rows appended to {args.llm_trace_csv}")
         return
 
     _run_data_dir(args)
@@ -670,6 +746,7 @@ def _normalize_bool_key(raw) -> str:
 def _completed_key_from_values(
     dataset: str,
     failed_builds_only: bool,
+    history_failed_builds_only: bool,
     filter_model: str,
     ranking_model: str,
     eval_window: int | str,
@@ -685,6 +762,7 @@ def _completed_key_from_values(
     return (
         dataset,
         failed_builds_only,
+        history_failed_builds_only,
         str(filter_model),
         str(ranking_model),
         str(eval_window),
@@ -714,9 +792,11 @@ def _load_completed(results_csv: Path) -> set[tuple]:
             if row.get("status") != "ok" or not row.get("dataset"):
                 continue
             fbo = _normalize_failed_builds_flag(row.get("failed_builds_only", ""))
+            hfbo = _normalize_failed_builds_flag(row.get("history_failed_builds_only", ""))
             done.add(_completed_key_from_values(
                 row["dataset"],
                 fbo,
+                hfbo,
                 row.get("filter_model", ""),
                 row.get("ranking_model", ""),
                 row.get("eval_window", ""),
@@ -761,6 +841,133 @@ def _append_csv_row(csv_path: Path, lock: threading.Lock, fieldnames: list[str],
             os.fsync(f.fileno())
 
 
+def _append_csv_rows(csv_path: Path, lock: threading.Lock, fieldnames: list[str], rows: list[dict]):
+    if not rows:
+        return
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock:
+        if csv_path.exists() and csv_path.stat().st_size > 0:
+            with open(csv_path, newline="") as existing:
+                reader = csv.DictReader(existing)
+                existing_header = reader.fieldnames or []
+                if existing_header != fieldnames:
+                    old_rows = list(reader)
+                    with open(csv_path, "w", newline="") as migrated:
+                        writer = csv.DictWriter(migrated, fieldnames=fieldnames)
+                        writer.writeheader()
+                        for old_row in old_rows:
+                            writer.writerow({
+                                k: old_row.get(k, "") for k in fieldnames
+                            })
+                        migrated.flush()
+                        os.fsync(migrated.fileno())
+
+        write_header = not csv_path.exists() or csv_path.stat().st_size == 0
+        with open(csv_path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if write_header:
+                writer.writeheader()
+            for row in rows:
+                writer.writerow({k: row.get(k, "") for k in fieldnames})
+            f.flush()
+            os.fsync(f.fileno())
+
+
+def _json_safe(value):
+    if pd.isna(value):
+        return None
+    if hasattr(value, "item"):
+        return value.item()
+    return value
+
+
+def _feature_json(row: dict, feature_cols: list[str]) -> str:
+    return json.dumps(
+        {col: _json_safe(row.get(col)) for col in feature_cols},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _append_llm_trace(
+    trace_csv: Path,
+    lock: threading.Lock,
+    *,
+    dataset: str,
+    target_build,
+    agent_input,
+    ranked: list[dict],
+    target,
+    build_apfd: float,
+    build_apfdc: float,
+    build_recall_at_10: float,
+    build_wall_seconds: float,
+    cap_meta: dict,
+):
+    """Append per-test evidence of what the LLM saw and produced for one build."""
+    ranked_by_test = {
+        int(item["test"]): item
+        for item in normalize_ranked_items(ranked)
+    }
+    target_by_test = {
+        int(row["Test"]): row
+        for row in target.to_dict("records")
+    }
+    feature_cols = [
+        col for col in agent_input.columns
+        if col not in ("Build", "Test", "Verdict", "Duration")
+    ]
+    input_has_verdict = "Verdict" in agent_input.columns
+    input_has_duration = "Duration" in agent_input.columns
+
+    rows = []
+    for rec in agent_input.to_dict("records"):
+        tid = int(rec["Test"])
+        ranked_item = ranked_by_test.get(tid, {})
+        target_row = target_by_test.get(tid, {})
+        rows.append({
+            "dataset": dataset,
+            "target_build": target_build,
+            "test": tid,
+            "filter_model": _filter_model,
+            "ranking_model": _ranking_model,
+            "batch_size": _batch_size,
+            "ranking_batch_size": _ranking_batch_size,
+            "ranking_workers": _ranking_workers,
+            "merge_agent": "1" if _merge_agent else "0",
+            "candidate_cap": cap_meta.get("cap", ""),
+            "candidate_selected_count": cap_meta.get("selected_count", ""),
+            "input_has_verdict": "1" if input_has_verdict else "0",
+            "input_has_duration": "1" if input_has_duration else "0",
+            "input_feature_count": len(feature_cols),
+            "llm_input_features_json": _feature_json(rec, feature_cols),
+            "llm_priority": ranked_item.get("priority", ""),
+            "llm_confidence": ranked_item.get("confidence", ""),
+            "llm_reason": ranked_item.get("reason", ""),
+            "actual_verdict": target_row.get("Verdict", ""),
+            "actual_duration": target_row.get("Duration", ""),
+            "build_apfd": f"{build_apfd:.6f}",
+            "build_apfdc": f"{build_apfdc:.6f}",
+            "build_recall_at_10": f"{build_recall_at_10:.6f}",
+            "build_wall_seconds": f"{build_wall_seconds:.1f}",
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        })
+
+    fieldnames = [
+        "dataset", "target_build", "test",
+        "filter_model", "ranking_model",
+        "batch_size", "ranking_batch_size", "ranking_workers", "merge_agent",
+        "candidate_cap", "candidate_selected_count",
+        "input_has_verdict", "input_has_duration", "input_feature_count",
+        "llm_input_features_json",
+        "llm_priority", "llm_confidence", "llm_reason",
+        "actual_verdict", "actual_duration",
+        "build_apfd", "build_apfdc", "build_recall_at_10",
+        "build_wall_seconds", "timestamp",
+    ]
+    _append_csv_rows(trace_csv, lock, fieldnames, rows)
+
+
 def _append_result(results_csv: Path, lock: threading.Lock, row: dict):
     """Atomically append one result row + fsync so a crash can't lose it.
 
@@ -771,6 +978,7 @@ def _append_result(results_csv: Path, lock: threading.Lock, row: dict):
     fieldnames = [
         "dataset", "apfd", "apfdc", "recall_at_10",
         "filter_model", "ranking_model", "eval_window", "failed_builds_only",
+        "history_failed_builds_only",
         "batch_size", "ranking_batch_size", "ranking_workers", "merge_agent",
         "merge_status_counts", "merge_repaired_builds", "merge_missing_total",
         "candidate_cap", "candidate_cap_recall_avg", "candidate_cap_recall_min",
@@ -785,6 +993,7 @@ def _append_build_result(results_csv: Path, lock: threading.Lock, row: dict):
         "dataset", "target_build", "build_index", "total_builds",
         "apfd", "apfdc", "recall_at_10", "num_tests", "num_failures",
         "filter_model", "ranking_model", "eval_window", "failed_builds_only",
+        "history_failed_builds_only",
         "batch_size", "ranking_batch_size", "ranking_workers", "merge_agent",
         "merge_status", "merge_missing_count",
         "candidate_cap", "candidate_selected_count", "candidate_tail_count",
@@ -806,9 +1015,12 @@ def _evaluate_one(f: Path, args, results_csv: Path, lock: threading.Lock) -> tup
             gap=args.gap,
             no_validation=args.no_validation,
             failed_builds_only=args.failed_builds_only,
+            history_failed_builds_only=args.history_failed_builds_only,
             diagnose=args.diagnose_failures,
             build_results_csv=args.build_results_csv,
             build_results_lock=lock,
+            llm_trace_csv=args.llm_trace_csv,
+            llm_trace_lock=lock,
         )
         elapsed = time.time() - start
         _append_result(results_csv, lock, {
@@ -820,6 +1032,7 @@ def _evaluate_one(f: Path, args, results_csv: Path, lock: threading.Lock) -> tup
             "ranking_model": _ranking_model,
             "eval_window": args.eval_window,
             "failed_builds_only": "1" if args.failed_builds_only else "0",
+            "history_failed_builds_only": "1" if args.history_failed_builds_only else "0",
             "batch_size": _batch_size,
             "ranking_batch_size": _ranking_batch_size,
             "ranking_workers": _ranking_workers,
@@ -848,9 +1061,10 @@ def _evaluate_one(f: Path, args, results_csv: Path, lock: threading.Lock) -> tup
             "error": "",
         })
         fbo_note = "fbo" if args.failed_builds_only else "all"
+        history_note = "+hfbo" if args.history_failed_builds_only else ""
         return f, (
             f"OK\tAPFD={a:.4f}\tAPFDc={ac:.4f}\t"
-            f"Recall@10={recall_at_10:.4f}\t{n_b}b\t{fbo_note}\t({elapsed:.0f}s)"
+            f"Recall@10={recall_at_10:.4f}\t{n_b}b\t{fbo_note}{history_note}\t({elapsed:.0f}s)"
         )
     except Exception as e:
         elapsed = time.time() - start
@@ -861,6 +1075,7 @@ def _evaluate_one(f: Path, args, results_csv: Path, lock: threading.Lock) -> tup
             "ranking_model": _ranking_model,
             "eval_window": args.eval_window,
             "failed_builds_only": "1" if args.failed_builds_only else "0",
+            "history_failed_builds_only": "1" if args.history_failed_builds_only else "0",
             "batch_size": _batch_size,
             "ranking_batch_size": _ranking_batch_size,
             "ranking_workers": _ranking_workers,
@@ -893,6 +1108,7 @@ def _run_data_dir(args):
         if _completed_key_from_values(
             f.name,
             args.failed_builds_only,
+            args.history_failed_builds_only,
             _filter_model,
             _ranking_model,
             args.eval_window,
@@ -908,9 +1124,10 @@ def _run_data_dir(args):
     ]
     skipped = len(files) - len(pending)
     mode = "failed-builds only" if args.failed_builds_only else "all builds"
+    history_mode = ", failed-history only" if args.history_failed_builds_only else ""
     if skipped:
         print(
-            f"[resume] {skipped}/{len(files)} datasets ({mode}) already in {results_csv} — skipping",
+            f"[resume] {skipped}/{len(files)} datasets ({mode}{history_mode}) already in {results_csv} — skipping",
             flush=True,
         )
     if not pending:
@@ -919,7 +1136,7 @@ def _run_data_dir(args):
 
     print(
         f"[start] {len(pending)} datasets, workers={args.workers}, "
-        f"filter={_filter_model}, ranking={_ranking_model}, eval={mode}",
+        f"filter={_filter_model}, ranking={_ranking_model}, eval={mode}{history_mode}",
         flush=True,
     )
 

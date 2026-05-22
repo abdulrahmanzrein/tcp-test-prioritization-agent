@@ -285,13 +285,57 @@ def _repair_ranked_tests(
     return _coerce_ranked_tests(parsed.ranked_tests)
 
 
+def _deterministic_repair_ranked_tests(
+    ranked: list[dict],
+    batch_ids: list[int],
+) -> list[dict]:
+    """Keep valid LLM order, then append any allowed IDs the LLM missed."""
+    def priority_key(item: dict) -> int:
+        try:
+            return int(item.get("priority", 10**6))
+        except (TypeError, ValueError):
+            return 10**6
+
+    allowed = set(batch_ids)
+    repaired: list[dict] = []
+    seen: set[int] = set()
+
+    for item in sorted(ranked, key=priority_key):
+        try:
+            tid = int(item["test"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if tid not in allowed or tid in seen:
+            continue
+        repaired.append({
+            "test": str(tid),
+            "priority": len(repaired) + 1,
+            "confidence": float(item.get("confidence", 0.5)),
+            "reason": item.get("reason") or "Recovered valid LLM ranking.",
+        })
+        seen.add(tid)
+
+    for tid in batch_ids:
+        if tid in seen:
+            continue
+        repaired.append({
+            "test": str(tid),
+            "priority": len(repaired) + 1,
+            "confidence": 0.4,
+            "reason": "Deterministic repair; missing from LLM output.",
+        })
+        seen.add(tid)
+
+    return repaired
+
+
 def _extract_ranked_tests(
     final_content: str,
     structured_model,
     batch_ids: list[int],
     ranking_model: str,
 ) -> list[dict]:
-    """Extract and LLM-repair a batch ranking without deterministic re-ranking."""
+    """Extract, repair, and guarantee membership for one ranking batch."""
     ranked = _extract_json_array(final_content)
     if ranked is None:
         ranked = _structured_extract(structured_model, final_content, ranking_model)
@@ -311,7 +355,15 @@ def _extract_ranked_tests(
     if not repaired_errors:
         return repaired
 
-    return ranked
+    deterministic = _deterministic_repair_ranked_tests(repaired, batch_ids)
+    deterministic_errors = _batch_validation_errors(deterministic, batch_ids)
+    if deterministic_errors:
+        raise ValueError(
+            "Ranking batch repair failed: "
+            f"{errors[:2]} -> {repaired_errors[:2]} -> {deterministic_errors[:2]}"
+        )
+    print(f"  [RANKING] Batch output deterministically repaired: {repaired_errors[:2]}")
+    return deterministic
 
 
 def _merge_validation_errors(ranked: list[dict], allowed_ids: list[int]) -> list[str]:

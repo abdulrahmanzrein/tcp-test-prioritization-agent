@@ -28,7 +28,6 @@ from pydantic import BaseModel, Field
 
 from tcp_agent.tools.feature_extractor import (
     extract_risk_profiles,
-    extract_failure_rates,
     extract_exec_times,
 )
 
@@ -94,7 +93,7 @@ negatives bury real failures and tank APFDc.
 
 ## You receive the FULL Yaraghi 2022 feature set per test
 
-Each test has up to 148 features across nine groups. Use them all when
+Each test has up to 150 features across nine groups. Use them all when
 they're present, but weight them by their empirical predictive power.
 
 ### Feature importance hierarchy (Yaraghi 2022 Table 12, RQ2.4)
@@ -196,9 +195,10 @@ T6 — Low-signal remainder
   use it as evidence in either direction.
 - Numeric thresholds are guidelines, not hard cutoffs. If a test is
   borderline-but-trending-risky, choose the higher tier.
-- DET_COV_C_Faults and DET_COV_IMP_Faults are NOT in your feature set
-  (they are excluded as label leakage — they count faults DETECTED in
-  the build being evaluated, which is post-hoc information).
+- DET_COV_C_Faults and DET_COV_IMP_Faults are in your feature set as
+  historical previously-detected-fault features for changed/impacted covered
+  source files. Treat them as coverage/fault-history signals, not as target
+  build Verdict labels.
 - Output: test_id (int), tier (int 1-6), and 1 (max 2) key_signals.
 - key_signals MUST be short "feature=value" strings, ≤30 chars each.
   Example: ["REC_TotalFailRate=0.92"], ["REC_Age=2"], ["TES_CHN_LinesAdded=14"].
@@ -231,13 +231,9 @@ def _build_batch_prompt(
 
     for profile in batch_profiles:
         tid = profile["test"]
-        fr = failure_rates.get(tid, 0.0)
-        et = exec_times.get(tid, 0.0)
 
-        # compact representation: only non-default features
+        # compact representation: only TCP-CI feature columns
         feats = {k: v for k, v in profile.items() if k != "test"}
-        feats["failure_rate"] = round(fr, 4)
-        feats["avg_exec_time"] = round(et, 2)
 
         lines.append(f"Test {tid}: {json.dumps(feats, separators=(',', ':'))}")
 
@@ -373,7 +369,7 @@ def run_filter_agent(
     providers.
     """
     risk_profiles = extract_risk_profiles(dataset_path, sparse=True)
-    failure_rates = extract_failure_rates(dataset_path)
+    failure_rates = {}
     exec_times = extract_exec_times(dataset_path)
 
     total_tests = len(risk_profiles)
@@ -390,8 +386,12 @@ def run_filter_agent(
         # merge classifications into result
         batch_test_ids = {p["test"] for p in batch}
         classified_ids = set()
+        unknown_ids = set()
 
         for cls in parsed.classifications:
+            if cls.test_id not in batch_test_ids:
+                unknown_ids.add(cls.test_id)
+                continue
             classified_ids.add(cls.test_id)
             entry = {
                 "test_id": cls.test_id,
@@ -403,6 +403,13 @@ def run_filter_agent(
                 result.high_risk_tests.append(entry)
             else:
                 result.low_signal_tests.append(entry)
+
+        if unknown_ids:
+            logger.warning(
+                "Filter LLM returned %d unknown test ID(s); ignoring: %s",
+                len(unknown_ids),
+                sorted(int(tid) for tid in unknown_ids)[:10],
+            )
 
         missed = batch_test_ids - classified_ids
         if missed:
@@ -448,6 +455,13 @@ def run_filter_agent(
     post_dedupe_ids = {
         entry["test_id"] for entry in result.high_risk_tests + result.low_signal_tests
     }
+    unknown_after_dedupe = post_dedupe_ids - all_expected_ids
+    if unknown_after_dedupe:
+        raise ValueError(
+            "Filter Agent produced unknown test ID(s) after duplicate cleanup: "
+            f"{sorted(int(tid) for tid in unknown_after_dedupe)[:10]}"
+        )
+
     missing_after_dedupe = all_expected_ids - post_dedupe_ids
     if missing_after_dedupe:
         raise ValueError(

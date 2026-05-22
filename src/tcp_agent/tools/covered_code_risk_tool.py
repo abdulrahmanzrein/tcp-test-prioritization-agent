@@ -9,7 +9,7 @@ Production mode: Extracts via SciTools Understand + pydriller (matches TCP-CI's
 
 from langchain_core.tools import tool
 
-from tcp_agent.config import get_mode, get_config, AgentMode
+from tcp_agent.config import get_mode, AgentMode
 from tcp_agent.data_cache import load_dataset
 
 # ── Feature column definitions ───────────────────────────────────────

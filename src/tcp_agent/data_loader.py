@@ -12,12 +12,10 @@ def get_features_and_labels(df):
     #turns verdict into either 0 (pass) or 1 (fail)
     y = (df["Verdict"] != 0).astype(int)
 
-    #drops the columns that are not features
-    # DET_COV_C_Faults and DET_COV_IMP_Faults tell you how many bugs the test actually found
-    # we can't know this before running the test — using it would be cheating
-    # C = in changed files, IMP = in files impacted by the change
+    # drops identifiers, labels, and execution outcomes. DET_COV_*_Faults stay
+    # in the feature matrix as historical previously-detected-fault features.
 
-    drop_cols = ["Build", "Test", "Verdict", "Duration", "DET_COV_C_Faults", "DET_COV_IMP_Faults"]
+    drop_cols = ["Build", "Test", "Verdict", "Duration"]
     X = df.drop(columns=drop_cols)
 
 
@@ -27,7 +25,6 @@ def get_features_and_labels(df):
 def get_metadata(df):
     #were gonna need this info later for specifying specific tests
     return df[["Build", "Test", "Duration", "Verdict"]].copy()
-
 
 
 
